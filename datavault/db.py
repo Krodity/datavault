@@ -16,7 +16,8 @@ _savepoints = itertools.count(1)
 def connect(path: Path | str, *, readonly: bool = False) -> sqlite3.Connection:
     """Open a connection with sane defaults for an app database."""
     if readonly:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+        # as_uri() percent-encodes, so paths with spaces, '?' or '#' work
+        conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, check_same_thread=False)
         conn.execute("PRAGMA query_only = ON")
     else:
         conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)  # autocommit; we manage txns
@@ -50,7 +51,8 @@ def transaction(conn: sqlite3.Connection):
     try:
         yield conn
     except BaseException:
-        conn.execute("ROLLBACK")
+        if conn.in_transaction:  # SQLite may already have rolled back (e.g. disk full)
+            conn.execute("ROLLBACK")
         raise
     conn.execute("COMMIT")
 
@@ -85,6 +87,10 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
         if num <= version:
             continue
         with transaction(conn):
+            # re-check under the write lock: another process (CLI vs. service)
+            # may have applied this migration while we waited for BEGIN IMMEDIATE
+            if current_version(conn) >= num:
+                continue
             if path.suffix == ".sql":
                 # executescript would COMMIT our transaction; split on ';' boundaries instead
                 for stmt in _split_sql(path.read_text()):

@@ -44,10 +44,10 @@ def png_bytes(color=(200, 30, 30), size=(64, 48)):
 
 def test_migrations_are_idempotent(cfg):
     a = open_db(cfg)
-    assert a.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert a.execute("PRAGMA user_version").fetchone()[0] == 3
     a.close()
     b = open_db(cfg)  # second open applies nothing
-    assert b.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 2
+    assert b.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 3
 
 
 def test_foreign_keys_enforced_and_cascade(conn):

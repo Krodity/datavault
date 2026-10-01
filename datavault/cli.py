@@ -37,9 +37,8 @@ def _table(columns: list[str], data: list[list], max_width: int = 40) -> str:
 
 
 def cmd_init(cfg, a):
-    conn = connect(cfg.db_path) if cfg.db_path.exists() else None
     cfg.ensure_dirs()
-    conn = conn or connect(cfg.db_path)
+    conn = connect(cfg.db_path)
     applied = migrate(conn)
     print(f"database: {cfg.db_path}")
     print(f"schema version: {current_version(conn)}" + (f" (applied {', '.join(applied)})" if applied else " (up to date)"))
@@ -61,9 +60,12 @@ def cmd_serve(cfg, a):
 
 def cmd_query(cfg, a):
     open_db(cfg).close()
-    sql = a.sql if a.sql != "-" else sys.stdin.read()
-    if a.file:
+    if a.file:  # checked first: reading stdin for the default "-" would block
         sql = Path(a.file).read_text()
+    elif a.sql == "-":
+        sql = sys.stdin.read()
+    else:
+        sql = a.sql
     res = QueryRunner(cfg, timeout_ms=a.timeout, max_rows=a.limit).run(sql, explain=a.explain)
     if a.format == "json":
         print(json.dumps([dict(zip(res["columns"], r)) for r in res["rows"]], indent=2, default=str))
@@ -157,7 +159,10 @@ def cmd_restore(cfg, a):
             return
     transfer.restore(cfg, Path(a.archive))
     conn = open_db(cfg)  # migrates an older backup forward
-    print(f"restored; schema version {current_version(conn)}")
+    report = media.verify_media(conn, cfg)  # thumbnails aren't in backups; rebuild them
+    print(f"restored; schema version {current_version(conn)}, {report['thumbs_rebuilt']} thumbnails rebuilt")
+    if report["missing_files"]:
+        print(f"warning: {len(report['missing_files'])} picture file(s) missing (backup made with --no-media?)")
 
 
 def cmd_add_picture(cfg, a):
@@ -287,7 +292,11 @@ def cmd_seed(cfg, a):
                                               {"label": "Rating", "type": "number"},
                                               {"label": "Price", "type": "money"},
                                               {"label": "Finished", "type": "date"},
-                                              {"label": "ISBN", "type": "code"}]})
+                                              {"label": "ISBN", "type": "code"},
+                                              {"label": "Price with tax", "type": "formula",
+                                               "formula": "price * 1.0825", "result": "money"},
+                                              {"label": "Verdict", "type": "formula", "result": "text",
+                                               "formula": 'IF(rating >= 5, "Must read", IF(rating >= 4, "Good", "—"))'}]})
     isbn = conn.execute("SELECT id FROM codes WHERE kind = 'isbn13'").fetchone()[0]
     for t, au, st, r in [("Designing Data-Intensive Applications", "Martin Kleppmann", "Reading", 5),
                          ("SQL Performance Explained", "Markus Winand", "Owned", 4),
@@ -296,17 +305,30 @@ def cmd_seed(cfg, a):
         repo.create_record(conn, s["slug"], {"title": t, "author": au, "status": st, "rating": r,
                                              "price": f"{rnd.uniform(25, 55):.2f}",
                                              "isbn": isbn if t.startswith("Designing") else None})
-    repo.create_section(conn, {"name": "Home Inventory", "icon": "🏠", "description": "Serial numbers & warranties",
-                               "fields": [{"label": "Item", "type": "text", "required": True},
-                                          {"label": "Room", "type": "select", "options": "Living,Kitchen,Office,Garage"},
-                                          {"label": "Serial number", "type": "text"},
-                                          {"label": "Purchase price", "type": "money"},
-                                          {"label": "Warranty until", "type": "date"},
-                                          {"label": "Receipt", "type": "picture"}]})
+    inv = repo.create_section(conn, {
+        "name": "Home Inventory", "icon": "🏠", "description": "Serial numbers & warranties",
+        "fields": [{"label": "Item", "type": "text", "required": True},
+                   {"label": "Room", "type": "select", "options": "Living,Kitchen,Office,Garage"},
+                   {"label": "Serial number", "type": "text"},
+                   {"label": "Quantity", "type": "number"},
+                   {"label": "Purchase price", "type": "money"},
+                   {"label": "Warranty until", "type": "date"},
+                   {"label": "Receipt", "type": "picture"},
+                   {"label": "Total value", "type": "formula", "formula": "purchase_price * COALESCE(quantity, 1)",
+                    "result": "money"},
+                   {"label": "Warranty days left", "type": "formula",
+                    "formula": "MAX(DAYS_BETWEEN(TODAY(), warranty_until), 0)", "result": "number"},
+                   {"label": "Under warranty", "type": "formula", "formula": "warranty_until >= TODAY()",
+                    "result": "boolean"}]})
+    for item, room, qty, price, days in [("MacBook Pro", "Office", 1, "2399", 400), ("Dining chairs", "Kitchen", 6, "89.50", -30),
+                                         ("Cordless drill", "Garage", 1, "149.99", 700), ("OLED TV", "Living", 1, "1299", 120)]:
+        repo.create_record(conn, inv["slug"], {"item": item, "room": room, "quantity": qty, "purchase_price": price,
+                                               "serial_number": f"SN-{rnd.randint(100000, 999999)}",
+                                               "warranty_until": (today + timedelta(days=days)).isoformat()})
     for name, sql in [("Spending this month by category", """SELECT category, printf('$%.2f', SUM(amount)) AS total
 FROM v_expenses WHERE month = strftime('%Y-%m', 'now') GROUP BY category ORDER BY SUM(amount) DESC;""")]:
         repo.save_query(conn, {"name": name, "sql": sql})
-    print(f"seeded {len(people)} contacts, {n} expenses, 6 codes, 3 pictures, 2 sections")
+    print(f"seeded {len(people)} contacts, {n} expenses, 6 codes, 3 pictures, 2 sections (with formula fields)")
 
 
 def build_parser() -> argparse.ArgumentParser:

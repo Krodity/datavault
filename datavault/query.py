@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 
@@ -49,12 +50,18 @@ class QueryRunner:
         return conn
 
     def run(self, sql: str, params: list | dict | None = None, *, explain: bool = False) -> dict:
-        sql = (sql or "").strip().rstrip(";").strip()
+        if not isinstance(sql, str):
+            raise ValidationError({"sql": "must be text"})
+        sql = sql.strip().rstrip(";").strip()
         if not sql:
             raise ValidationError({"sql": "is empty"})
-        if not sqlite3.complete_statement(sql + ";"):
+        if len(sql) > 100_000:
+            raise ValidationError({"sql": "is too long"})
+        # newline first, so a trailing "-- comment" doesn't swallow the terminator
+        if not sqlite3.complete_statement(sql + "\n;"):
             raise ValidationError({"sql": "is incomplete (unbalanced quotes or parentheses?)"})
-        if explain:
+        params = _check_params(params)
+        if explain and not re.match(r"(?is)^\s*(--[^\n]*\n\s*)*explain\b", sql):
             sql = "EXPLAIN QUERY PLAN " + sql
         conn = self._conn()
         deadline = time.perf_counter() + self.timeout_ms / 1000
@@ -71,7 +78,7 @@ class QueryRunner:
             elif "not authorized" in msg or "authorization denied" in msg or "prohibited" in msg or "readonly" in msg:
                 msg = "only read-only statements (SELECT, WITH, EXPLAIN, informational PRAGMAs) are allowed here"
             raise ValidationError({"sql": msg}) from None
-        except sqlite3.ProgrammingError as e:
+        except (sqlite3.ProgrammingError, sqlite3.InterfaceError, OverflowError) as e:
             raise ValidationError({"sql": str(e)}) from None
         finally:
             elapsed = (time.perf_counter() - started) * 1000
@@ -104,6 +111,18 @@ class QueryRunner:
             return out
         finally:
             conn.close()
+
+
+def _check_params(params):
+    """Bound parameters must be a flat list or {name: value} of scalars."""
+    if params in (None, "", [], {}):
+        return ()
+    scalar = (str, int, float, bool, type(None))
+    if isinstance(params, list) and all(isinstance(p, scalar) for p in params):
+        return [int(p) if isinstance(p, bool) else p for p in params]
+    if isinstance(params, dict) and all(isinstance(k, str) and isinstance(p, scalar) for k, p in params.items()):
+        return {k: int(p) if isinstance(p, bool) else p for k, p in params.items()}
+    raise ValidationError({"params": "must be a list or object of plain values"})
 
 
 def _jsonable(x):

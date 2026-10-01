@@ -295,7 +295,7 @@ async function contactForm(existing, onSaved) {
 }
 
 route("/contacts(?:/(\\d+))?", async (el, id, params) => {
-  const state = { q: params.q || "", tag: params.tag || "", sort: "name", selected: id ? +id : null };
+  const state = { q: params.q || "", tag: params.tag || "", sort: "name", selected: id ? +id : null, limit: 200 };
   el.innerHTML = `
     <div class="page-head"><div><h1>Contacts</h1><p>People, companies and how to reach them.</p></div>
       <div class="actions">
@@ -316,13 +316,15 @@ route("/contacts(?:/(\\d+))?", async (el, id, params) => {
       `<span class="pill tag click ${state.tag === t.name ? "on" : ""}" data-tag="${esc(t.name)}" style="background:${esc(colorFor(t.name))}">${esc(t.name)} ${t.contact_count}</span>`).join("");
   };
   const loadList = async () => {
-    const r = await api(`/api/contacts?${qs({ q: state.q, tag: state.tag, sort: state.sort, limit: 500 })}`);
+    const r = await api(`/api/contacts?${qs({ q: state.q, tag: state.tag, sort: state.sort, limit: state.limit })}`);
     $("#list", el).innerHTML = r.items.map((c) => `
       <div class="contact-item ${c.id === state.selected ? "active" : ""}" data-id="${c.id}">${avatar(c)}
         <div class="meta"><div><b>${esc(c.full_name)}</b> ${c.favorite ? "<span style='color:#eab308'>★</span>" : ""}</div>
         <div class="muted small">${esc([c.job_title, c.company].filter(Boolean).join(" · ") || c.email || c.phone)}</div></div></div>`).join("")
       || `<div class="empty"><b>No contacts</b>${state.q || state.tag ? "Nothing matches the filter" : "Add your first contact"}</div>`;
-    $("#count", el).textContent = `${r.total} contact${r.total === 1 ? "" : "s"}`;
+    $("#count", el).innerHTML = `<span>${r.total} contact${r.total === 1 ? "" : "s"}${r.total > r.items.length ? ` · showing ${r.items.length}` : ""}</span>
+      ${r.total > r.items.length && state.limit < 500 ? `<button class="ghost small" id="more">Show more</button>` : ""}`;
+    $("#more", el)?.addEventListener("click", () => { state.limit = 500; loadList().catch(fail); });
   };
   const showDetail = async (cid) => {
     state.selected = cid;
@@ -361,8 +363,8 @@ route("/contacts(?:/(\\d+))?", async (el, id, params) => {
     };
   };
 
-  $("#q", el).addEventListener("input", debounce((e) => { state.q = e.target.value; loadList(); }));
-  $("#sort", el).addEventListener("change", (e) => { state.sort = e.target.value; loadList(); });
+  $("#q", el).addEventListener("input", debounce((e) => { state.q = e.target.value; loadList().catch(fail); }));
+  $("#sort", el).addEventListener("change", (e) => { state.sort = e.target.value; loadList().catch(fail); });
   $("#tag-chips", el).addEventListener("click", (e) => {
     const t = e.target.closest("[data-tag]");
     if (!t) return;
@@ -539,6 +541,9 @@ function categoryManager(onChange) {
   load();
 }
 
+// column -> [first-click sort, second-click sort] (keys of EXPENSE_SORTS on the server)
+const EXPENSE_SORT = { date: ["date", "date_asc"], amount: ["amount", "amount_asc"], merchant: ["merchant", "merchant_desc"] };
+
 route("/expenses", async (el, params) => {
   const now = new Date();
   const state = { q: "", category_id: "", date_from: "", date_to: "", min_amount: "", max_amount: "", contact_id: params.contact_id || "",
@@ -588,8 +593,11 @@ route("/expenses", async (el, params) => {
     $("#sum", el).innerHTML = `${r.total ? `${r.offset + 1}–${end} of ${r.total}` : "0"} · total <b>${money(r.sum_cents)}</b>`;
     $("#prev", el).disabled = r.offset === 0;
     $("#next", el).disabled = end >= r.total;
-    $$("th.sortable", el).forEach((th) => th.textContent = th.textContent.replace(/ [▲▼]$/, "") +
-      (state.sort.startsWith(th.dataset.sort) ? (state.sort.endsWith("_asc") ? " ▲" : " ▼") : ""));
+    $$("th.sortable", el).forEach((th) => {
+      const [first, second] = EXPENSE_SORT[th.dataset.sort];
+      const arrow = state.sort === first ? (th.dataset.sort === "merchant" ? " ▲" : " ▼") : state.sort === second ? (th.dataset.sort === "merchant" ? " ▼" : " ▲") : "";
+      th.textContent = th.textContent.replace(/ [▲▼]$/, "") + arrow;
+    });
   };
   const refresh = () => Promise.all([loadRows(), loadSummary()]).catch(fail);
   const bind = (sel, key) => $(sel, el).addEventListener("input", debounce((e) => { state[key] = e.target.value; state.offset = 0; loadRows().catch(fail); }, 300));
@@ -600,10 +608,9 @@ route("/expenses", async (el, params) => {
   $("#prev", el).onclick = () => { state.offset = Math.max(0, state.offset - state.limit); loadRows(); };
   $("#next", el).onclick = () => { state.offset += state.limit; loadRows(); };
   $$("th.sortable", el).forEach((th) => th.addEventListener("click", () => {
-    const k = th.dataset.sort;
-    state.sort = state.sort === k ? `${k}_asc` : k;
-    if (state.sort === "merchant_asc") state.sort = "merchant";
-    state.offset = 0; loadRows();
+    const [first, second] = EXPENSE_SORT[th.dataset.sort];  // click toggles between the two directions
+    state.sort = state.sort === first ? second : first;
+    state.offset = 0; loadRows().catch(fail);
   }));
   $("#rows", el).addEventListener("click", async (e) => {
     const tr = e.target.closest("tr[data-id]");
@@ -765,7 +772,18 @@ route("/codes", async (el) => {
 
 // =============================================================== sections
 const FIELD_TYPES = { text: "Text", longtext: "Long text", number: "Number", money: "Money", date: "Date", boolean: "Yes / No", select: "Choice list",
-  url: "Link", email: "Email", picture: "Picture", contact: "Contact", code: "Barcode / QR" };
+  url: "Link", email: "Email", picture: "Picture", contact: "Contact", code: "Barcode / QR", formula: "ƒ Formula" };
+const RESULT_TYPES = { number: "→ Number", money: "→ Money", text: "→ Text", date: "→ Date", boolean: "→ Yes / No" };
+const RESERVED = new Set(["id", "section_id", "created_at", "updated_at"]);
+// mirrors validation.field_key on the server, so the builder can show the keys formulas use
+const fieldKey = (s) => {
+  let k = String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  if (!k || /^[0-9]/.test(k)) k = "f_" + k;
+  return RESERVED.has(k) ? "f_" + k : k;
+};
+const resultType = (f) => (f.type === "formula" ? f.options?.result || "number" : f.type);
+const isNumeric = (f) => ["money", "number"].includes(resultType(f));
+let FORMULA_FUNCS = null;
 
 async function loadSectionNav() {
   const secs = await api("/api/sections");
@@ -776,8 +794,12 @@ async function loadSectionNav() {
   $$("#section-nav a").forEach((a) => a.classList.toggle("active", cur.startsWith(a.getAttribute("href"))));
 }
 
-function sectionBuilder(existing) {
-  const fields = existing ? existing.fields.map((f) => ({ ...f, options: f.options.join(", ") })) : [{ label: "Name", type: "text", required: true, options: "" }];
+async function sectionBuilder(existing) {
+  FORMULA_FUNCS = FORMULA_FUNCS || await api("/api/formula/functions").catch(() => []);
+  const fields = existing ? existing.fields.map((f) => f.type === "formula"
+    ? { key: f.key, label: f.label, type: "formula", required: false, options: "", formula: f.options.expr, result: f.options.result }
+    : { key: f.key, label: f.label, type: f.type, required: f.required, options: f.options.join(", ") })
+    : [{ label: "Name", type: "text", required: true, options: "" }];
   const m = modal({
     title: existing ? `Edit “${existing.name}”` : "New section", wide: true,
     body: `<div class="form-grid" style="grid-template-columns:80px 1fr">
@@ -786,40 +808,100 @@ function sectionBuilder(existing) {
         <label class="field full"><span>Description</span><input id="s-desc" value="${esc(existing?.description || "")}"></label></div>
       <h3 style="margin-top:18px">Fields <span class="muted small" style="text-transform:none;letter-spacing:0">— drag to reorder</span></h3>
       <div class="field-rows" id="rows"></div>
-      <button class="ghost small" id="add" style="margin-top:10px">＋ Add field</button>
-      ${existing ? `<p class="muted small">Renaming a field label keeps its data. Removing a field hides its values (they stay in the stored JSON).</p>` : ""}`,
+      <div class="actions" style="margin-top:10px"><button class="ghost small" id="add">＋ Add field</button>
+        <button class="ghost small" id="add-fx">ƒ Add formula</button></div>
+      <details class="formula-help" id="fx-help" ${fields.some((f) => f.type === "formula") ? "open" : ""}>
+        <summary>Formula help</summary>
+        <p class="small">Use field names like <code>price * quantity</code>. Spreadsheet style works too:
+          <code>=IF(status = "Owned", price, 0)</code>, <code>first &amp; " " &amp; last</code>, <code>total ^ 2</code>, <code>&lt;&gt;</code>.
+          Blank inputs give a blank result; dividing by zero gives a blank.</p>
+        <div class="small"><b>Fields:</b> <span id="fx-keys"></span></div>
+        <div class="fx-funcs small">${(FORMULA_FUNCS || []).map((f) => `<code title="${esc(f.help)}" data-fn="${esc(f.name)}">${esc(f.help)}</code>`).join("")}</div>
+      </details>
+      ${existing ? `<p class="muted small">Renaming a field label keeps its data. Removing a field hides its values (they stay in the stored JSON).
+        Formulas are recalculated for every record when you save.</p>` : ""}`,
     foot: `${existing ? `<button class="ghost danger" data-del>Delete section</button><span class="spacer"></span>` : ""}
       <button class="ghost" data-close>Cancel</button><button data-save>${existing ? "Save" : "Create section"}</button>`,
   });
+  let lastFocusedFx = null;
+  const keysNow = () => fields.map((f) => f.key || fieldKey(f.label));
+  const renderKeys = () => {
+    m.$("#fx-keys").innerHTML = fields.map((f, i) => f.label ? `<code class="click" data-key="${esc(keysNow()[i])}" title="${esc(f.label)}">${esc(keysNow()[i])}</code>` : "").join(" ");
+  };
   const render = () => {
-    m.$("#rows").innerHTML = fields.map((f, i) => `<div class="field-row" draggable="true" data-i="${i}"><span class="grip">⋮⋮</span>
+    m.$("#rows").innerHTML = fields.map((f, i) => {
+      const fx = f.type === "formula";
+      return `<div class="field-row ${fx ? "fx" : ""}" draggable="true" data-i="${i}"><span class="grip">⋮⋮</span>
       <input data-k="label" value="${esc(f.label)}" placeholder="Field label">
       <select data-k="type">${Object.entries(FIELD_TYPES).map(([k, v]) => `<option value="${k}" ${f.type === k ? "selected" : ""}>${v}</option>`).join("")}</select>
-      <input data-k="options" value="${esc(f.options || "")}" placeholder="${f.type === "select" ? "Choices, comma-separated" : "—"}" ${f.type === "select" ? "" : "disabled"}>
-      <label class="check small"><input type="checkbox" data-k="required" ${f.required ? "checked" : ""}> Required</label>
-      <button class="icon-btn" data-rm title="Remove">✕</button></div>`).join("");
+      ${fx ? `<input data-k="formula" class="mono" value="${esc(f.formula || "")}" placeholder="e.g. price * quantity" spellcheck="false">
+        <select data-k="result">${Object.entries(RESULT_TYPES).map(([k, v]) => `<option value="${k}" ${(f.result || "number") === k ? "selected" : ""}>${v}</option>`).join("")}</select>`
+      : `<input data-k="options" value="${esc(f.options || "")}" placeholder="${f.type === "select" ? "Choices, comma-separated" : "—"}" ${f.type === "select" ? "" : "disabled"}>
+        <label class="check small"><input type="checkbox" data-k="required" ${f.required ? "checked" : ""}> Required</label>`}
+      <button class="icon-btn" data-rm title="Remove">✕</button>
+      ${fx ? `<div class="fx-msg small" data-msg="${i}"></div>` : ""}</div>`;
+    }).join("");
+    renderKeys();
+    checkFormulas();
   };
+  // live validation + sample evaluation for one formula row
+  const checkOne = async (i) => {
+    const f = fields[i], slot = m.$(`[data-msg="${i}"]`);
+    if (!f || f.type !== "formula" || !slot) return;
+    if (!(f.formula || "").trim()) { slot.className = "fx-msg small muted"; slot.textContent = "Type a formula"; return; }
+    const sample = {};
+    fields.forEach((o, j) => { if (j !== i && isNumeric(o) && o.type !== "formula") sample[keysNow()[j]] = 10; });
+    try {
+      const r = await api("/api/formula/check", { method: "POST", body: {
+        fields: fields.map((o, j) => ({ key: keysNow()[j], label: o.label })), key: keysNow()[i], expr: f.formula, result: f.result || "number", sample } });
+      slot.className = `fx-msg small ${r.ok ? "ok" : "bad"}`;
+      slot.textContent = r.ok ? `✓ valid${r.refs.length ? ` · uses ${r.refs.join(", ")}` : ""}${r.volatile ? " · refreshes daily" : ""}`
+        + (Object.keys(sample).length && r.value != null
+          ? ` · if every number were 10 → ${(f.result || "number") === "money" ? money(r.value) : r.value}` : "") : `✗ ${r.error}`;
+    } catch (e) { slot.className = "fx-msg small bad"; slot.textContent = e.message; }
+  };
+  // one shared debounce that re-checks *every* formula row (a per-call debounce would drop all but the last row)
+  const checkFormulas = debounce(() => fields.forEach((f, i) => { if (f.type === "formula") checkOne(i); }), 300);
   render();
   m.$("#rows").addEventListener("input", (e) => {
     const row = e.target.closest("[data-i]"), k = e.target.dataset.k; if (!row || !k) return;
-    fields[row.dataset.i][k] = e.target.type === "checkbox" ? e.target.checked : e.target.value;
-    if (k === "type") render();
+    const i = +row.dataset.i, f = fields[i];
+    f[k] = e.target.type === "checkbox" ? e.target.checked : e.target.value;
+    if (k === "type") { if (f.type === "formula") { f.required = false; f.result = f.result || "number"; } render(); }
+    else if (k === "label") { renderKeys(); checkFormulas(); }
+    else if (k === "formula" || k === "result") checkFormulas();
+  });
+  m.$("#rows").addEventListener("focusin", (e) => { if (e.target.dataset.k === "formula") lastFocusedFx = e.target; });
+  // clicking a field key or function in the help panel inserts it into the formula being edited
+  m.$("#fx-help").addEventListener("click", (e) => {
+    const k = e.target.closest("[data-key]")?.dataset.key || (e.target.closest("[data-fn]") ? `${e.target.closest("[data-fn]").dataset.fn}(` : null);
+    if (!k || !lastFocusedFx) return;
+    lastFocusedFx.setRangeText(k, lastFocusedFx.selectionStart, lastFocusedFx.selectionEnd, "end");
+    lastFocusedFx.dispatchEvent(new Event("input", { bubbles: true }));
+    lastFocusedFx.focus();
   });
   m.$("#rows").addEventListener("click", (e) => { if (e.target.closest("[data-rm]")) { fields.splice(e.target.closest("[data-i]").dataset.i, 1); render(); } });
   let dragFrom = null;
-  m.$("#rows").addEventListener("dragstart", (e) => { dragFrom = +e.target.closest("[data-i]").dataset.i; e.target.classList.add("dragging"); });
+  m.$("#rows").addEventListener("dragstart", (e) => {
+    if (e.target.matches?.("input, select")) return;
+    dragFrom = +e.target.closest("[data-i]").dataset.i; e.target.classList.add("dragging");
+  });
   m.$("#rows").addEventListener("dragover", (e) => e.preventDefault());
   m.$("#rows").addEventListener("drop", (e) => {
     e.preventDefault(); const to = e.target.closest("[data-i]"); if (!to || dragFrom == null) return;
     const [f] = fields.splice(dragFrom, 1); fields.splice(+to.dataset.i, 0, f); dragFrom = null; render();
   });
   m.$("#add").onclick = () => { fields.push({ label: "", type: "text", required: false, options: "" }); render(); $$("[data-k=label]", m.el).at(-1).focus(); };
+  m.$("#add-fx").onclick = () => {
+    fields.push({ label: "", type: "formula", required: false, options: "", formula: "", result: "number" });
+    m.$("#fx-help").open = true; render(); $$("[data-k=label]", m.el).at(-1).focus();
+  };
   m.$("[data-save]").onclick = async () => {
     const body = { name: m.$("#s-name").value, icon: m.$("#s-icon").value, description: m.$("#s-desc").value, fields };
     try {
       const s = existing ? await api(`/api/sections/${existing.id}`, { method: "PUT", body }) : await api("/api/sections", { method: "POST", body });
       m.close(); toast(existing ? "Section updated" : "Section created"); await loadSectionNav();
-      location.hash = `#/s/${s.slug}`; if (existing) navigate();
+      if (location.hash === `#/s/${s.slug}`) navigate(); else location.hash = `#/s/${s.slug}`;
     } catch (e) { fail(e); }
   };
   m.$("[data-del]")?.addEventListener("click", async () => {
@@ -835,7 +917,9 @@ async function recordForm(sec, existing, onSaved) {
     needs("contact") ? api("/api/contacts?limit=500") : { items: [] }, needs("picture") ? api("/api/pictures?limit=500") : { items: [] },
     needs("code") ? api("/api/codes?limit=500") : { items: [] }]);
   const d = existing?.data || {};
-  const F = sec.fields.map((f) => {
+  const inputs = sec.fields.filter((f) => f.type !== "formula");
+  const computed = sec.fields.filter((f) => f.type === "formula");
+  const F = inputs.map((f) => {
     const base = { name: f.key, label: f.label, required: f.required };
     switch (f.type) {
       case "longtext": return { ...base, type: "textarea", full: true };
@@ -853,15 +937,19 @@ async function recordForm(sec, existing, onSaved) {
     }
   });
   const values = { ...d };
-  sec.fields.filter((f) => f.type === "money").forEach((f) => { if (d[f.key] != null) values[f.key] = (d[f.key] / 100).toFixed(2); });
+  inputs.filter((f) => f.type === "money").forEach((f) => { if (d[f.key] != null) values[f.key] = (d[f.key] / 100).toFixed(2); });
+  const fxBlock = computed.length ? `<div class="computed"><h3>ƒ Calculated</h3><dl class="kv small">${computed.map((f) =>
+    `<dt>${esc(f.label)}</dt><dd>${existing ? renderCell(f, d[f.key]) : `<span class="muted">calculated on save</span>`}
+      <span class="muted mono" style="font-size:11px"> = ${esc(f.options.expr)}</span></dd>`).join("")}</dl></div>` : "";
   const m = modal({
-    title: existing ? `Edit ${sec.name} record` : `New ${sec.name} record`, wide: F.length > 5, body: formHtml(F, values),
+    title: existing ? `Edit ${sec.name} record` : `New ${sec.name} record`, wide: F.length > 5, body: formHtml(F, values) + fxBlock,
     foot: `${existing ? `<button class="ghost danger" data-del>Delete</button><span class="spacer"></span>` : ""}<button class="ghost" data-close>Cancel</button><button data-save>Save</button>`,
   });
   m.$("[data-save]").onclick = async () => {
     try {
       const body = readForm(m.el, F);
-      existing ? await api(`/api/records/${existing.id}`, { method: "PATCH", body }) : await api(`/api/sections/${sec.id}/records`, { method: "POST", body });
+      if (existing) await api(`/api/records/${existing.id}`, { method: "PATCH", body });
+      else await api(`/api/sections/${sec.id}/records`, { method: "POST", body });
       m.close(); toast("Saved"); onSaved();
     } catch (e) { showErrors(m.el, e); }
   };
@@ -873,15 +961,17 @@ async function recordForm(sec, existing, onSaved) {
 
 function renderCell(f, v) {
   if (v == null || v === "") return `<span class="muted">—</span>`;
-  switch (f.type) {
+  const t = resultType(f);
+  switch (t) {
     case "money": return `<span class="num">${money(v)}</span>`;
+    case "number": return `<span class="num">${esc(typeof v === "number" ? v.toLocaleString(undefined, { maximumFractionDigits: 6 }) : v)}</span>`;
     case "boolean": return v ? "✓" : `<span class="muted">✗</span>`;
     case "date": return esc(fmtDate(v));
     case "url": return `<a href="${esc(v)}" target="_blank" rel="noopener">${esc(v.replace(/^https?:\/\//, "").slice(0, 40))}</a>`;
     case "email": return `<a href="mailto:${esc(v)}">${esc(v)}</a>`;
-    case "picture": return `<a href="#/pictures?open=${v}"><img class="thumb" src="/media/${v}/thumb"></a>`;
-    case "contact": return `<a href="#/contacts/${v}">contact #${v}</a>`;
-    case "code": return `<img src="/api/codes/${v}/image.png" style="height:34px;background:#fff;border-radius:4px">`;
+    case "picture": return `<a href="#/pictures?open=${+v}"><img class="thumb" src="/media/${+v}/thumb"></a>`;
+    case "contact": return `<a href="#/contacts/${+v}">contact #${+v}</a>`;
+    case "code": return `<img src="/api/codes/${+v}/image.png" style="height:34px;background:#fff;border-radius:4px">`;
     case "select": return `<span class="pill">${esc(v)}</span>`;
     case "longtext": return `<span title="${esc(v)}">${esc(String(v).slice(0, 80))}${String(v).length > 80 ? "…" : ""}</span>`;
     default: return esc(v);
@@ -892,36 +982,42 @@ route("/s/([a-z0-9-]+)", async (el, slug) => {
   const state = { q: "", sort: "", desc: false, filters: {} };
   let sec = await api(`/api/sections/${slug}`);
   const filterable = sec.fields.filter((f) => ["select", "boolean"].includes(f.type));
+  const hasFx = sec.fields.some((f) => f.type === "formula");
   el.innerHTML = `
     <div class="page-head"><div><h1>${esc(sec.icon)} ${esc(sec.name)}</h1><p>${esc(sec.description || "Custom section")}</p></div>
-      <div class="actions"><button class="ghost" id="edit">Edit fields</button><a class="btn ghost" href="/api/export/section:${esc(sec.slug)}.csv">Export CSV</a>
+      <div class="actions">${hasFx ? `<button class="ghost" id="recalc" title="Recompute every formula">ƒ Recalculate</button>` : ""}
+        <button class="ghost" id="edit">Edit fields</button><a class="btn ghost" href="/api/export/section:${esc(sec.slug)}.csv">Export CSV</a>
         <button id="new">＋ New record</button></div></div>
     <div class="toolbar"><input type="search" id="q" placeholder="Search records…">
-      ${filterable.map((f) => `<select data-filter="${f.key}"><option value="">${esc(f.label)}: any</option>
+      ${filterable.map((f) => `<select data-filter="${esc(f.key)}"><option value="">${esc(f.label)}: any</option>
         ${(f.type === "boolean" ? [["true", "Yes"], ["false", "No"]] : f.options.map((o) => [o, o])).map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("")}</select>`).join("")}
       <span class="muted small" id="count"></span></div>
     <div class="card flush"><div class="table-wrap"><table><thead><tr>${sec.fields.map((f) =>
-      `<th class="sortable ${["money", "number"].includes(f.type) ? "right" : ""}" data-sort="${f.key}">${esc(f.label)}</th>`).join("")}
-      <th class="sortable" data-sort="updated_at">Updated</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+      `<th class="sortable ${isNumeric(f) ? "right" : ""}" data-sort="${esc(f.key)}" ${f.type === "formula" ? `title="= ${esc(f.options.expr)}"` : ""}>${f.type === "formula" ? "ƒ " : ""}${esc(f.label)}</th>`).join("")}
+      <th class="sortable" data-sort="updated_at">Updated</th></tr></thead><tbody id="rows"></tbody><tfoot id="totals"></tfoot></table></div></div>
     <p class="muted small" style="margin-top:12px">Stored as JSON documents in <code>section_records</code> — query them in the SQL console with
-      <code>json_extract(data, '$.${esc(sec.fields[0]?.key || "field")}')</code>.</p>`;
+      <code>json_extract(data, '$.${esc(sec.fields[0]?.key || "field")}')</code>. Formula results are stored too, so they can be sorted and queried.</p>`;
   const load = async () => {
     const f = Object.fromEntries(Object.entries(state.filters).map(([k, v]) => [`f.${k}`, v]));
     const r = await api(`/api/sections/${sec.id}/records?${qs({ q: state.q, sort: state.sort, desc: state.desc ? 1 : "", ...f, limit: 1000 })}`);
-    $("#count", el).textContent = `${r.total} record${r.total === 1 ? "" : "s"}`;
+    $("#count", el).textContent = `${r.total} record${r.total === 1 ? "" : "s"}${r.total > r.items.length ? ` (showing ${r.items.length})` : ""}`;
     $("#rows", el).innerHTML = r.items.map((rec) => `<tr class="clickable" data-id="${rec.id}">${sec.fields.map((fl) =>
-      `<td class="${["money", "number"].includes(fl.type) ? "num" : ""}">${renderCell(fl, rec.data[fl.key])}</td>`).join("")}
+      `<td class="${isNumeric(fl) ? "num" : ""}">${renderCell(fl, rec.data[fl.key])}</td>`).join("")}
       <td class="muted small nowrap">${ago(rec.updated_at)}</td></tr>`).join("")
       || `<tr><td colspan="${sec.fields.length + 1}"><div class="empty"><b>No records</b>Click “New record” to add one.</div></td></tr>`;
+    const t = r.totals || {};
+    $("#totals", el).innerHTML = Object.keys(t).length ? `<tr class="totals">${sec.fields.map((fl, i) =>
+      `<td class="${isNumeric(fl) ? "num" : ""}">${fl.key in t ? `<b>${resultType(fl) === "money" ? money(t[fl.key]) : esc((t[fl.key] ?? 0).toLocaleString(undefined, { maximumFractionDigits: 6 }))}</b>`
+        : i === 0 ? `<span class="muted">Σ Total</span>` : ""}</td>`).join("")}<td></td></tr>` : "";
     $$("th.sortable", el).forEach((th) => th.textContent = th.textContent.replace(/ [▲▼]$/, "") + (state.sort === th.dataset.sort ? (state.desc ? " ▼" : " ▲") : ""));
   };
-  $("#q", el).addEventListener("input", debounce((e) => { state.q = e.target.value; load(); }));
+  $("#q", el).addEventListener("input", debounce((e) => { state.q = e.target.value; load().catch(fail); }));
   $$("[data-filter]", el).forEach((s) => s.addEventListener("change", () => {
     if (s.value) state.filters[s.dataset.filter] = s.value; else delete state.filters[s.dataset.filter]; load().catch(fail);
   }));
   $$("th.sortable", el).forEach((th) => th.addEventListener("click", () => {
     if (state.sort === th.dataset.sort) state.desc = !state.desc; else { state.sort = th.dataset.sort; state.desc = false; }
-    load();
+    load().catch(fail);
   }));
   $("#rows", el).addEventListener("click", async (e) => {
     if (e.target.closest("a")) return;
@@ -929,7 +1025,11 @@ route("/s/([a-z0-9-]+)", async (el, slug) => {
     if (tr) recordForm(sec, await api(`/api/records/${tr.dataset.id}`), () => { load(); loadSectionNav(); }).catch(fail);
   });
   $("#new", el).onclick = () => recordForm(sec, null, () => { load(); loadSectionNav(); }).catch(fail);
-  $("#edit", el).onclick = async () => { sec = await api(`/api/sections/${sec.id}`); sectionBuilder(sec); };
+  $("#edit", el).onclick = async () => { sec = await api(`/api/sections/${sec.id}`); sectionBuilder(sec).catch(fail); };
+  $("#recalc", el)?.addEventListener("click", async () => {
+    const r = await api(`/api/sections/${sec.id}/recalculate`, { method: "POST" }).catch(fail);
+    if (r) { toast(`Recalculated · ${r.changed} record${r.changed === 1 ? "" : "s"} changed`); load(); }
+  });
   await load();
 });
 
@@ -938,7 +1038,9 @@ route("/sql", async (el, params) => {
   const [schema, examples] = await Promise.all([api("/api/schema"), api("/api/query/examples")]);
   let saved = await api("/api/queries");
   let last = null;
-  const initial = params.sql || localStorage.getItem("dv.sql") || examples[0].sql;
+  let stored = null;
+  try { stored = localStorage.getItem("dv.sql"); } catch { /* storage blocked */ }
+  const initial = params.sql || stored || examples[0].sql;
   el.innerHTML = `
     <div class="page-head"><div><h1>SQL Console</h1><p>Read-only, time-boxed queries against the live database. <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run.</p></div></div>
     <div class="sql-layout">
@@ -961,7 +1063,7 @@ route("/sql", async (el, params) => {
     saved.map((q) => `<option value="${q.id}">${esc(q.name)}</option>`).join(""); };
   renderSaved();
   const run = async (explain = false) => {
-    localStorage.setItem("dv.sql", ed.value);
+    try { localStorage.setItem("dv.sql", ed.value); } catch { /* storage blocked */ }
     const sel = ed.value.substring(ed.selectionStart, ed.selectionEnd).trim();
     const sql = sel || ed.value;
     $("#out", el).innerHTML = `<div class="result-meta">Running…</div>`;
@@ -1158,7 +1260,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupTheme();
   setupSearch();
   $("#menu-btn").onclick = () => $("#sidebar").classList.toggle("open");
-  $("#new-section").onclick = () => sectionBuilder(null);
+  $("#new-section").onclick = () => sectionBuilder(null).catch(fail);
   window.addEventListener("hashchange", () => { navigate(); loadSectionNav().catch(() => {}); });
   await loadSectionNav().catch(fail);
   api("/api/stats").then((s) => ($("#db-meta").textContent = `${fmtBytes(s.db_bytes)} · v${s.schema_version}`)).catch(() => {});

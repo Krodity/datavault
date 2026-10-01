@@ -8,6 +8,9 @@ import re
 import sqlite3
 from typing import Any, Iterable
 
+from datetime import date
+
+from . import formulas as fx
 from . import validation as v
 from .db import transaction
 from .validation import NotFound, ValidationError
@@ -56,6 +59,20 @@ def _page(limit, offset, max_limit=500) -> tuple[int, int]:
     return limit, offset
 
 
+def _filter_value(field: str, coerce, raw):
+    """Coerce a query-string filter, reporting bad input as a 400 not a 500."""
+    try:
+        return coerce(raw)
+    except ValueError as e:
+        raise ValidationError({field: str(e)}) from None
+
+
+def _dumps(data: dict) -> str:
+    # ensure_ascii=False keeps "Zoë" as Zoë in the stored JSON, so LIKE and
+    # json_extract comparisons work on the real characters (not \u00eb)
+    return json.dumps(data, ensure_ascii=False)
+
+
 def _like(q: str) -> str:
     return "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
@@ -83,13 +100,23 @@ def delete_tag(conn, tag_id: int) -> None:
 
 
 def _set_contact_tags(conn, contact_id: int, tags: Any) -> None:
+    if tags is None:
+        tags = []
     if isinstance(tags, str):
-        tags = [t for t in re.split(r"[;,]", tags)]
-    names = [str(t.get("name") if isinstance(t, dict) else t).strip() for t in (tags or [])]
-    names = [n for n in dict.fromkeys(names) if n]
+        tags = re.split(r"[;,]", tags)
+    if not isinstance(tags, list):
+        raise ValidationError({"tags": "must be a list or a comma-separated string"})
+    names = [str(t.get("name") if isinstance(t, dict) else t).strip() for t in tags]
+    names = list(dict.fromkeys(n for n in names if n))  # de-dupe, keep order
+    if len(names) > 50:
+        raise ValidationError({"tags": "at most 50 tags per contact"})
     conn.execute("DELETE FROM contact_tags WHERE contact_id = ?", (contact_id,))
     for n in names:
-        conn.execute("INSERT INTO contact_tags (contact_id, tag_id) VALUES (?, ?)", (contact_id, upsert_tag(conn, n)))
+        try:
+            tag_id = upsert_tag(conn, n)
+        except ValidationError as e:
+            raise ValidationError({"tags": f"{n[:20]!r} {next(iter(e.errors.values()))}"}) from None
+        conn.execute("INSERT OR IGNORE INTO contact_tags (contact_id, tag_id) VALUES (?, ?)", (contact_id, tag_id))
 
 
 # =============================================================== contacts
@@ -121,7 +148,7 @@ def list_contacts(conn, *, q: str = "", tag: str = "", favorite: Any = None,
         params["tag"] = tag
     if favorite not in (None, ""):
         where.append("favorite = :fav")
-        params["fav"] = v.boolean(favorite)
+        params["fav"] = _filter_value("favorite", v.boolean, favorite)
     w = ("WHERE " + " AND ".join(where)) if where else ""
     order = CONTACT_SORTS.get(sort)
     if order is None:
@@ -190,7 +217,7 @@ def find_duplicate_contacts(conn) -> list[dict]:
 EXPENSE_SORTS = {
     "date": "spent_on DESC, id DESC", "date_asc": "spent_on ASC, id ASC",
     "amount": "amount_cents DESC", "amount_asc": "amount_cents ASC",
-    "merchant": "merchant COLLATE NOCASE",
+    "merchant": "merchant COLLATE NOCASE, spent_on DESC", "merchant_desc": "merchant COLLATE NOCASE DESC, spent_on DESC",
 }
 
 
@@ -198,8 +225,10 @@ def _expense_clean(data: dict, partial=False) -> dict:
     data = dict(data)
     if "amount" in data:  # API/CSV speak dollars; the column is cents
         data["amount_cents"] = data.pop("amount")
-    elif "amount_cents" in data and isinstance(data["amount_cents"], int):
-        data["amount_cents"] = str(data["amount_cents"] / 100)
+    elif isinstance(data.get("amount_cents"), int) and not isinstance(data["amount_cents"], bool):
+        # exact: integer cents -> "123.45" without a float round-trip
+        c = data["amount_cents"]
+        data["amount_cents"] = f"{'-' if c < 0 else ''}{abs(c) // 100}.{abs(c) % 100:02d}"
     for k in ("category", "contact_name", "amount_cents_display", "month", "category_color"):
         data.pop(k, None)
     return v.EXPENSE.clean(data, partial=partial)
@@ -223,10 +252,10 @@ def list_expenses(conn, *, q="", category_id=None, date_from=None, date_to=None,
             where.append("category_id IS NULL")
         else:
             where.append("category_id = :cat")
-            params["cat"] = v.fk(category_id)
+            params["cat"] = _filter_value("category_id", v.fk, category_id)
     if contact_id not in (None, ""):
         where.append("contact_id = :cid")
-        params["cid"] = v.fk(contact_id)
+        params["cid"] = _filter_value("contact_id", v.fk, contact_id)
     try:
         if date_from:
             where.append("spent_on >= :df")
@@ -279,40 +308,56 @@ def delete_expense(conn, expense_id: int) -> None:
         _delete(conn, "expenses", expense_id)
 
 
-def expense_summary(conn, month: str | None = None, months: int = 12) -> dict:
-    """Dashboard numbers, each one a single aggregate query."""
-    if month and not re.fullmatch(r"\d{4}-\d{2}", month):
+def _month_bounds(month: str) -> tuple[str, str]:
+    y, m = map(int, month.split("-"))
+    nxt = date(y + (m == 12), m % 12 + 1, 1)
+    return f"{month}-01", nxt.isoformat()
+
+
+def expense_summary(conn, month: str | None = None, months: Any = 12) -> dict:
+    """Dashboard numbers. Month filters are written as half-open date ranges
+    (spent_on >= '2026-03-01' AND spent_on < '2026-04-01') rather than
+    substr(spent_on, 1, 7) = '2026-03', so SQLite can use idx_expenses_date."""
+    if month and not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
         raise ValidationError({"month": "must be YYYY-MM"})
     month = month or conn.execute("SELECT strftime('%Y-%m', 'now', 'localtime')").fetchone()[0]
-    months = max(1, min(int(months), 60))
+    try:
+        months = max(1, min(int(months), 60))
+    except (TypeError, ValueError):
+        raise ValidationError({"months": "must be an integer"}) from None
+    start, end = _month_bounds(month)
     trend = rows(conn.execute("""
-        WITH RECURSIVE m(month, i) AS (
-            SELECT :month, 0
+        WITH RECURSIVE m(start, i) AS (
+            SELECT :start, 0
             UNION ALL
-            SELECT strftime('%Y-%m', date(month || '-01', '-1 month')), i + 1 FROM m WHERE i + 1 < :n
+            SELECT date(start, '-1 month'), i + 1 FROM m WHERE i + 1 < :n
         )
-        SELECT m.month, COALESCE(SUM(e.amount_cents), 0) AS total_cents, COUNT(e.id) AS n
-          FROM m LEFT JOIN expenses e ON substr(e.spent_on, 1, 7) = m.month
-         GROUP BY m.month ORDER BY m.month""", {"month": month, "n": months}))
+        SELECT substr(m.start, 1, 7) AS month,
+               (SELECT COALESCE(SUM(amount_cents), 0) FROM expenses
+                 WHERE spent_on >= m.start AND spent_on < date(m.start, '+1 month')) AS total_cents,
+               (SELECT COUNT(*) FROM expenses
+                 WHERE spent_on >= m.start AND spent_on < date(m.start, '+1 month')) AS n
+          FROM m ORDER BY m.start""", {"start": start, "n": months}))
     by_category = rows(conn.execute("""
         SELECT COALESCE(c.id, 0) AS category_id, COALESCE(c.name, 'Uncategorized') AS category,
                COALESCE(c.color, '#9ca3af') AS color, c.monthly_budget_cents AS budget_cents,
                COALESCE(SUM(e.amount_cents), 0) AS total_cents, COUNT(e.id) AS n
           FROM expense_categories c
-          FULL OUTER JOIN (SELECT * FROM expenses WHERE substr(spent_on, 1, 7) = :month) e ON e.category_id = c.id
+          FULL OUTER JOIN (SELECT * FROM expenses WHERE spent_on >= :start AND spent_on < :end) e
+                       ON e.category_id = c.id
          GROUP BY 1, 2, 3, 4
         HAVING total_cents > 0 OR budget_cents IS NOT NULL
-         ORDER BY total_cents DESC""", {"month": month}))
+         ORDER BY total_cents DESC, category""", {"start": start, "end": end}))
     top_merchants = rows(conn.execute("""
         SELECT merchant, COUNT(*) AS n, SUM(amount_cents) AS total_cents
-          FROM expenses WHERE merchant <> '' AND spent_on >= date(:month || '-01', '-11 months')
-         GROUP BY merchant COLLATE NOCASE ORDER BY total_cents DESC LIMIT 8""", {"month": month}))
+          FROM expenses WHERE merchant <> '' AND spent_on >= date(:start, '-11 months') AND spent_on < :end
+         GROUP BY merchant COLLATE NOCASE ORDER BY total_cents DESC LIMIT 8""", {"start": start, "end": end}))
     totals = one(conn, """
         SELECT COALESCE(SUM(amount_cents), 0) AS month_cents, COUNT(*) AS month_count,
                (SELECT COALESCE(SUM(amount_cents), 0) FROM expenses
-                 WHERE substr(spent_on, 1, 7) = strftime('%Y-%m', date(:month || '-01', '-1 month'))) AS prev_month_cents,
+                 WHERE spent_on >= date(:start, '-1 month') AND spent_on < :start) AS prev_month_cents,
                (SELECT COALESCE(SUM(monthly_budget_cents), 0) FROM expense_categories) AS budget_cents
-          FROM expenses WHERE substr(spent_on, 1, 7) = :month""", {"month": month})
+          FROM expenses WHERE spent_on >= :start AND spent_on < :end""", {"start": start, "end": end})
     return {"month": month, "totals": totals, "trend": trend, "by_category": by_category, "top_merchants": top_merchants}
 
 
@@ -363,7 +408,11 @@ def category_id_for(conn, name: str, create: bool = True) -> int | None:
         return r[0]
     if not create:
         raise ValidationError({"category": f"unknown category {name!r}"})
-    return _insert(conn, "expense_categories", {"name": name})
+    try:
+        clean = v.CATEGORY.clean({"name": name})
+    except ValidationError as e:
+        raise ValidationError({"category": e.errors.get("name", str(e))}) from None
+    return _insert(conn, "expense_categories", clean)
 
 
 # =============================================================== pictures
@@ -407,33 +456,60 @@ def update_picture(conn, pic_id: int, data: dict) -> dict:
 # =============================================================== sections
 
 FIELD_TYPES = ("text", "longtext", "number", "money", "date", "boolean", "select",
-               "url", "email", "picture", "contact", "code")
+               "url", "email", "picture", "contact", "code", "formula")
+NUMERIC_RESULTS = ("number", "money")
+RESERVED_KEYS = {"id", "section_id", "created_at", "updated_at"}
 
 
 def _clean_fields(fields: Any) -> list[dict]:
     if not isinstance(fields, list) or not fields:
         raise ValidationError({"fields": "a section needs at least one field"})
+    if len(fields) > 100:
+        raise ValidationError({"fields": "at most 100 fields per section"})
     out, seen = [], set()
     for i, f in enumerate(fields):
         if not isinstance(f, dict):
             raise ValidationError({"fields": f"field #{i + 1} must be an object"})
-        label = v.text(60)(f.get("label") or f.get("key") or "")
+        try:
+            label = v.text(60)(f.get("label") or f.get("key") or "")
+            required = v.boolean(f.get("required"))
+        except ValueError as e:
+            raise ValidationError({"fields": f"field #{i + 1}: {e}"}) from None
         if not label:
             raise ValidationError({"fields": f"field #{i + 1} needs a label"})
-        key = v.field_key(f.get("key") or label)
+        key = v.field_key(str(f.get("key") or label))
+        if key in RESERVED_KEYS:
+            key = f"f_{key}"
         if key in seen:
-            raise ValidationError({"fields": f"duplicate field key {key!r}"})
+            raise ValidationError({"fields": f"two fields would both be stored as {key!r} — rename one"})
         seen.add(key)
         ftype = f.get("type", "text")
         if ftype not in FIELD_TYPES:
             raise ValidationError({"fields": f"field {label!r}: unknown type {ftype!r}"})
-        options = f.get("options") or []
-        if isinstance(options, str):
-            options = [o.strip() for o in options.split(",") if o.strip()]
-        if ftype == "select" and not options:
-            raise ValidationError({"fields": f"field {label!r}: a select needs options"})
-        out.append({"key": key, "label": label, "type": ftype, "required": v.boolean(f.get("required")),
-                    "options": json.dumps(options), "position": i})
+        options: Any = f.get("options")
+        if ftype == "formula":
+            src = options if isinstance(options, dict) else {}
+            expr = f.get("formula", src.get("expr", ""))
+            result = f.get("result", src.get("result", "number"))
+            options = {"expr": v.text(fx.MAX_EXPR_LEN)(expr), "result": result}
+            required = 0  # computed, never typed in
+        else:
+            if isinstance(options, str):
+                options = options.split(",")
+            if not isinstance(options, list):
+                options = []
+            # select options are compared as strings, so store them as strings
+            options = list(dict.fromkeys(str(o).strip()[:100] for o in options if str(o).strip()))[:200]
+            if ftype == "select" and not options:
+                raise ValidationError({"fields": f"field {label!r}: a choice list needs options"})
+        out.append({"key": key, "label": label, "type": ftype, "required": required,
+                    "options": options, "position": i})
+    try:  # compile every formula against the final field list (catches typos and cycles)
+        fx.compile_section(out)
+    except fx.FormulaError as e:
+        raise ValidationError({"fields": f"formula {e}"}) from None
+    for f in out:
+        f["options"] = json.dumps(f["options"], ensure_ascii=False)
     return out
 
 
@@ -441,17 +517,27 @@ def list_sections(conn) -> list[dict]:
     secs = rows(conn.execute("""
         SELECT s.*, (SELECT COUNT(*) FROM section_records r WHERE r.section_id = s.id) AS record_count
           FROM sections s ORDER BY s.name COLLATE NOCASE"""))
+    fields = {}
+    for f in _all_fields(conn):  # one query for every section's fields, not one per section
+        fields.setdefault(f["section_id"], []).append(f)
     for s in secs:
-        s["fields"] = _fields(conn, s["id"])
+        s["fields"] = fields.get(s["id"], [])
     return secs
 
 
+def _decode_field(f: dict) -> dict:
+    f["options"] = json.loads(f["options"])
+    f["required"] = bool(f["required"])
+    return f
+
+
+def _all_fields(conn) -> list[dict]:
+    return [_decode_field(f) for f in rows(conn.execute("SELECT * FROM section_fields ORDER BY section_id, position, id"))]
+
+
 def _fields(conn, section_id: int) -> list[dict]:
-    fs = rows(conn.execute("SELECT * FROM section_fields WHERE section_id = ? ORDER BY position, id", (section_id,)))
-    for f in fs:
-        f["options"] = json.loads(f["options"])
-        f["required"] = bool(f["required"])
-    return fs
+    return [_decode_field(f) for f in rows(conn.execute(
+        "SELECT * FROM section_fields WHERE section_id = ? ORDER BY position, id", (section_id,)))]
 
 
 def get_section(conn, ref: int | str) -> dict:
@@ -464,18 +550,31 @@ def get_section(conn, ref: int | str) -> dict:
     return s
 
 
-def create_section(conn, data: dict) -> dict:
-    name = v.text(80)(data.get("name"))
-    if not name:
+def _section_meta(data: dict, existing: dict | None = None) -> dict:
+    meta = {}
+    try:
+        if existing is None or "name" in data:
+            meta["name"] = v.text(80)(data.get("name")) or (existing or {}).get("name", "")
+        if existing is None or "icon" in data:
+            meta["icon"] = v.text(8)(data.get("icon")) or "📁"
+        if existing is None or "description" in data:
+            meta["description"] = v.text(1000)(data.get("description"))
+    except ValueError as e:
+        raise ValidationError({"name": str(e)}) from None
+    if "name" in meta and not meta["name"]:
         raise ValidationError({"name": "is required"})
+    return meta
+
+
+def create_section(conn, data: dict) -> dict:
+    meta = _section_meta(data)
     fields = _clean_fields(data.get("fields"))
-    slug = v.slugify(data.get("slug") or name)
+    slug = v.slugify(str(data.get("slug") or meta["name"]))
     with transaction(conn):
         base, n = slug, 2
         while conn.execute("SELECT 1 FROM sections WHERE slug = ?", (slug,)).fetchone():
             slug, n = f"{base}-{n}", n + 1
-        sid = _insert(conn, "sections", {"name": name, "slug": slug, "icon": v.text(8)(data.get("icon")) or "📁",
-                                          "description": v.text(1000)(data.get("description"))})
+        sid = _insert(conn, "sections", {**meta, "slug": slug})
         for f in fields:
             _insert(conn, "section_fields", {**f, "section_id": sid})
     return get_section(conn, sid)
@@ -485,30 +584,53 @@ def update_section(conn, section_id: int, data: dict) -> dict:
     """Rename/re-describe a section and replace its field list. Fields keep
     their key, so existing record values survive a re-order or relabel;
     removing a field leaves its old values in the JSON (recoverable) but
-    hides them."""
+    hides them. Formulas are recomputed for every record."""
     sec = get_section(conn, section_id)
+    meta = _section_meta(data, sec)
+    fields = _clean_fields(data["fields"]) if "fields" in data else None
     with transaction(conn):
-        meta = {}
-        if "name" in data:
-            meta["name"] = v.text(80)(data["name"]) or sec["name"]
-        if "icon" in data:
-            meta["icon"] = v.text(8)(data["icon"]) or "📁"
-        if "description" in data:
-            meta["description"] = v.text(1000)(data["description"])
         if meta:
             meta["updated_at"] = conn.execute("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')").fetchone()[0]
             _update(conn, "sections", sec["id"], meta)
-        if "fields" in data:
-            fields = _clean_fields(data["fields"])
+        if fields is not None:
             conn.execute("DELETE FROM section_fields WHERE section_id = ?", (sec["id"],))
             for f in fields:
                 _insert(conn, "section_fields", {**f, "section_id": sec["id"]})
+            recalculate_section(conn, sec["id"])
     return get_section(conn, sec["id"])
 
 
 def delete_section(conn, section_id: int) -> None:
     with transaction(conn):
         _delete(conn, "sections", section_id)
+
+
+def recalculate_section(conn, section_id: int) -> int:
+    """Recompute every formula in a section. Returns the number of records
+    whose stored values changed."""
+    fields = _fields(conn, section_id)
+    compiled = fx.compile_section(fields)
+    changed = 0
+    with transaction(conn):
+        if compiled:
+            for r in conn.execute("SELECT id, data FROM section_records WHERE section_id = ?", (section_id,)).fetchall():
+                old = json.loads(r["data"])
+                new = fx.apply(fields, old, compiled)
+                if new != old:
+                    conn.execute("UPDATE section_records SET data = ? WHERE id = ?", (_dumps(new), r["id"]))
+                    changed += 1
+        conn.execute("UPDATE sections SET recalculated_on = date('now', 'localtime') WHERE id = ?", (section_id,))
+    return changed
+
+
+def _refresh_volatile(conn, sec: dict) -> None:
+    """Formulas using TODAY() go stale overnight; refresh them once per day."""
+    if not any(f["type"] == "formula" and "TODAY" in f["options"].get("expr", "").upper() for f in sec["fields"]):
+        return
+    today = conn.execute("SELECT date('now', 'localtime')").fetchone()[0]
+    if sec.get("recalculated_on") != today:
+        recalculate_section(conn, sec["id"])
+        sec["recalculated_on"] = today
 
 
 def _coerce_value(conn, f: dict, raw: Any) -> Any:
@@ -532,7 +654,7 @@ def _coerce_value(conn, f: dict, raw: Any) -> Any:
     if t == "email":
         return v.email(raw)
     if t == "select":
-        s = str(raw).strip()
+        s = str(v._scalar(raw)).strip()
         if s not in f["options"]:
             raise ValueError(f"must be one of: {', '.join(f['options'])}")
         return s
@@ -542,15 +664,19 @@ def _coerce_value(conn, f: dict, raw: Any) -> Any:
         if ref and not conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (ref,)).fetchone():
             raise ValueError(f"refers to a missing {t} (id {ref})")
         return ref
+    if t == "formula":
+        raise ValueError("is calculated by its formula and can't be set directly")
     raise ValueError(f"unsupported type {t}")
 
 
 def _clean_record(conn, section: dict, data: dict, existing: dict | None = None) -> dict:
-    values = data.get("data", data) if isinstance(data.get("data"), dict) else data
+    values = data["data"] if isinstance(data.get("data"), dict) else data
     out = dict(existing or {})
     errors = {}
     keys = {f["key"] for f in section["fields"]}
     for f in section["fields"]:
+        if f["type"] == "formula":
+            continue  # computed below; any submitted value is ignored
         if f["key"] not in values:
             if existing is None and f["required"]:
                 errors[f["key"]] = "is required"
@@ -563,12 +689,15 @@ def _clean_record(conn, section: dict, data: dict, existing: dict | None = None)
         if f["required"] and val in (None, ""):
             errors[f["key"]] = "is required"
         out[f["key"]] = val
-    unknown = set(values) - keys - {"id", "section_id", "created_at", "updated_at"}
+    unknown = set(values) - keys - RESERVED_KEYS
     if unknown:
-        errors["_"] = f"unknown field(s): {', '.join(sorted(unknown))}"
+        errors["_"] = f"unknown field(s): {', '.join(sorted(map(str, unknown)))}"
     if errors:
         raise ValidationError(errors)
-    return out
+    try:
+        return fx.apply(section["fields"], out)
+    except fx.FormulaError as e:  # a stored formula no longer compiles
+        raise ValidationError({"_": f"formula {e}"}) from None
 
 
 def _record_out(r: dict) -> dict:
@@ -576,23 +705,33 @@ def _record_out(r: dict) -> dict:
     return r
 
 
+def _numeric_keys(sec: dict) -> list[str]:
+    return [f["key"] for f in sec["fields"]
+            if f["type"] in NUMERIC_RESULTS
+            or (f["type"] == "formula" and f["options"].get("result") in NUMERIC_RESULTS)]
+
+
 def list_records(conn, section_ref, *, q="", sort="", desc=False, filters: dict | None = None,
                  limit=100, offset=0) -> dict:
     sec = get_section(conn, section_ref)
+    _refresh_volatile(conn, sec)
     limit, offset = _page(limit, offset, 1000)
     keys = {f["key"]: f for f in sec["fields"]}
     where, params = ["section_id = :sid"], {"sid": sec["id"]}
     if q:
-        where.append("data LIKE :q ESCAPE '\\'")
+        # search values only (not the JSON keys), via the json_each table-valued function
+        where.append("EXISTS (SELECT 1 FROM json_each(section_records.data) j WHERE j.value LIKE :q ESCAPE '\\')")
         params["q"] = _like(q)
     for i, (k, val) in enumerate((filters or {}).items()):
         if k not in keys:
             raise ValidationError({"filter": f"unknown field {k!r}"})
+        f = keys[k]
+        if f["type"] == "formula":
+            raise ValidationError({"filter": f"can't filter on formula field {k!r}"})
         # key is allow-listed above, so it is safe to place in the JSON path
         where.append(f"json_extract(data, '$.{k}') = :f{i}")
-        params[f"f{i}"] = _coerce_value(conn, keys[k], val)
-        if isinstance(params[f"f{i}"], bool):
-            params[f"f{i}"] = int(params[f"f{i}"])
+        val = _filter_value(k, lambda raw, f=f: _coerce_value(conn, f, raw), val)
+        params[f"f{i}"] = int(val) if isinstance(val, bool) else val
     if sort and sort not in keys and sort not in ("created_at", "updated_at"):
         raise ValidationError({"sort": f"unknown field {sort!r}"})
     order = (f"json_extract(data, '$.{sort}')" if sort in keys else sort) if sort else "id"
@@ -600,8 +739,16 @@ def list_records(conn, section_ref, *, q="", sort="", desc=False, filters: dict 
     w = " AND ".join(where)
     total = conn.execute(f"SELECT COUNT(*) FROM section_records WHERE {w}", params).fetchone()[0]
     items = rows(conn.execute(
-        f"SELECT * FROM section_records WHERE {w} ORDER BY {order} {direction} NULLS LAST, id DESC LIMIT {limit} OFFSET {offset}", params))
-    return {"section": sec, "items": [_record_out(r) for r in items], "total": total, "limit": limit, "offset": offset}
+        f"SELECT * FROM section_records WHERE {w} ORDER BY {order} {direction} NULLS LAST, id DESC "
+        f"LIMIT {limit} OFFSET {offset}", params))
+    totals = {}
+    num_keys = _numeric_keys(sec)
+    if num_keys and total:
+        # column totals over the whole filtered set (not just this page), in one pass
+        sums = ", ".join(f"SUM(json_extract(data, '$.{k}')) AS \"{k}\"" for k in num_keys)
+        totals = dict(conn.execute(f"SELECT {sums} FROM section_records WHERE {w}", params).fetchone())
+    return {"section": sec, "items": [_record_out(r) for r in items], "total": total, "totals": totals,
+            "limit": limit, "offset": offset}
 
 
 def get_record(conn, record_id: int) -> dict:
@@ -615,7 +762,7 @@ def create_record(conn, section_ref, data: dict) -> dict:
     sec = get_section(conn, section_ref)
     clean = _clean_record(conn, sec, data)
     with transaction(conn):
-        rid = _insert(conn, "section_records", {"section_id": sec["id"], "data": json.dumps(clean)})
+        rid = _insert(conn, "section_records", {"section_id": sec["id"], "data": _dumps(clean)})
     return get_record(conn, rid)
 
 
@@ -624,7 +771,7 @@ def update_record(conn, record_id: int, data: dict) -> dict:
     sec = get_section(conn, rec["section_id"])
     clean = _clean_record(conn, sec, data, existing=rec["data"])
     with transaction(conn):
-        _update(conn, "section_records", record_id, {"data": json.dumps(clean)})
+        _update(conn, "section_records", record_id, {"data": _dumps(clean)})
     return get_record(conn, record_id)
 
 
@@ -646,7 +793,7 @@ def search(conn, q: str, limit: int = 30, kind: str = "") -> list[dict]:
     match = _fts_query(q)
     if not match:
         return []
-    params = {"m": match, "lim": max(1, min(int(limit), 200))}
+    params = {"m": match, "lim": max(1, min(_filter_value("limit", int, limit), 200))}
     kind_sql = ""
     if kind:
         kind_sql, params["kind"] = "AND kind = :kind", kind
@@ -677,14 +824,23 @@ def stats(conn) -> dict:
           FROM audit_log a
          WHERE a.table_name IN ('contacts', 'expenses', 'pictures', 'codes', 'sections', 'section_records')
          ORDER BY a.id DESC LIMIT 15"""))
+    # Birthdays are built as "Jan 1 of <year> + (month-1) months + (day-1) days"
+    # so Feb 29 lands on Mar 1 in non-leap years instead of becoming NULL.
     upcoming = rows(conn.execute("""
-        SELECT id, trim(first_name || ' ' || last_name) AS name, birthday,
-               CAST(julianday(next_bday) - julianday(date('now', 'localtime')) AS INTEGER) AS days_until
-          FROM (SELECT *, CASE WHEN date(strftime('%Y', 'now', 'localtime') || substr(birthday, 5)) >= date('now', 'localtime')
-                               THEN date(strftime('%Y', 'now', 'localtime') || substr(birthday, 5))
-                               ELSE date((strftime('%Y', 'now', 'localtime') + 1) || substr(birthday, 5)) END AS next_bday
-                  FROM contacts WHERE birthday IS NOT NULL)
-         WHERE days_until <= 30 ORDER BY days_until"""))
+        WITH t AS (SELECT date('now', 'localtime') AS today, CAST(strftime('%Y', 'now', 'localtime') AS INTEGER) AS y),
+        b AS (
+            SELECT c.id, trim(c.first_name || ' ' || c.last_name) AS name, c.birthday,
+                   date(t.y || '-01-01', '+' || (CAST(substr(c.birthday, 6, 2) AS INTEGER) - 1) || ' months',
+                        '+' || (CAST(substr(c.birthday, 9, 2) AS INTEGER) - 1) || ' days') AS this_year,
+                   date((t.y + 1) || '-01-01', '+' || (CAST(substr(c.birthday, 6, 2) AS INTEGER) - 1) || ' months',
+                        '+' || (CAST(substr(c.birthday, 9, 2) AS INTEGER) - 1) || ' days') AS next_year,
+                   t.today
+              FROM contacts c, t WHERE c.birthday IS NOT NULL
+        )
+        SELECT id, name, birthday,
+               CAST(julianday(CASE WHEN this_year >= today THEN this_year ELSE next_year END) - julianday(today) AS INTEGER)
+                   AS days_until
+          FROM b WHERE days_until <= 30 ORDER BY days_until, name"""))
     return {"counts": counts, "db_bytes": page, "activity": activity, "upcoming_birthdays": upcoming,
             "schema_version": conn.execute("PRAGMA user_version").fetchone()[0]}
 

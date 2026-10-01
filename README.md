@@ -4,7 +4,7 @@ A personal, local-first database app for **contacts, pictures, expenses, barcode
 
 The project is about **moving data in and out correctly**: validating it at the boundary, storing it in a well-constrained schema, querying it efficiently, and getting it back out in standard formats without loss.
 
-![stack](https://img.shields.io/badge/python-3.11+-blue) ![db](https://img.shields.io/badge/SQLite-FTS5%20%7C%20JSON1%20%7C%20WAL-003b57) ![tests](https://img.shields.io/badge/tests-46%20passing-brightgreen)
+![stack](https://img.shields.io/badge/python-3.11+-blue) ![db](https://img.shields.io/badge/SQLite-FTS5%20%7C%20JSON1%20%7C%20WAL-003b57) ![tests](https://img.shields.io/badge/tests-116%20passing-brightgreen)
 
 ---
 
@@ -16,7 +16,8 @@ The project is about **moving data in and out correctly**: validating it at the 
 | **Pictures** | Content-addressed storage (SHA-256 dedup), EXIF date and camera extraction, thumbnails, albums, decompression-bomb guard, integrity sweep |
 | **Expenses** | Integer-cent money, categories with monthly budgets, receipt photos, 12-month trend, budget-vs-actual, top merchants, filters and pagination |
 | **Barcodes / QR** | Generate QR, EAN-13/8, UPC-A, Code 128/39, and ISBN-13 (check digits computed and verified), Wi-Fi QR builder, PNG/SVG export, decode from photos or a **live webcam** |
-| **Custom sections** | Define your own "tables" in the UI (12 field types: text, money, date, select, picture/contact/code links, …). Records are validated JSON documents. Sort and filter on any field |
+| **Custom sections** | Define your own "tables" in the UI (13 field types: text, money, date, select, picture/contact/code links, **formulas**, …). Records are validated JSON documents. Sort and filter on any field; numeric columns get totals |
+| **Formulas** | Spreadsheet-style computed fields: `price * quantity`, `IF(status = "Owned", price, 0)`, `DAYS_BETWEEN(TODAY(), warranty_until)`, `first & " " & last`. Around 35 functions, exact Decimal math, dependency-ordered evaluation with cycle detection, and live validation in the field builder. Results are stored, so they can be sorted and queried in SQL |
 | **SQL console** | Read-only, sandboxed, time-boxed SQL with a schema browser, `EXPLAIN QUERY PLAN`, saved queries, example analytics (window functions, CTEs, FTS), and CSV export |
 | **Search** | One full-text index across every entity (FTS5, porter stemming, prefix matching, ranked with bm25 and highlighted snippets) |
 | **Import / export** | CSV import with automatic header mapping (Google / Outlook / bank exports), dry runs, all-or-nothing transactions, a per-line error report; CSV, JSON and vCard export |
@@ -54,12 +55,14 @@ datavault stats --verify-media
 
 ```
 datavault/
-├── migrations/          versioned schema: 0001_init.sql, 0002_search_and_audit.py (generates triggers)
+├── migrations/          versioned schema: 0001_init.sql, 0002_search_and_audit.py (generates triggers),
+│                        0003_formulas_and_perf.py (table rebuild, rowid-keyed FTS, FK indexes)
 ├── db.py                connection setup (WAL, FKs, busy timeout), transactions + savepoints, migration runner
 ├── validation.py        one Schema per entity; the API, CLI and importers share the same rules
 ├── repo.py              data-access layer: parameterized SQL, allow-listed identifiers
 ├── media.py             image ingestion, EXIF, thumbnails, integrity checks
 ├── codes.py             barcode/QR validation, rendering, decoding (pyzbar)
+├── formulas.py          safe formula engine (AST whitelist, Decimal math, dependency graph)
 ├── query.py             sandboxed read-only SQL console
 ├── transfer.py          CSV/vCard/JSON import-export, backup/restore
 ├── web.py               Flask REST API (≈60 endpoints) + security headers
@@ -72,7 +75,9 @@ datavault/
 - **Money as `INTEGER` cents.** Parsing goes through `Decimal` with banker-safe rounding, so `0.1 + 0.2` never drifts.
 - **`CHECK` constraints** enforce ISO dates (`GLOB`), non-negative amounts, enum columns, valid JSON (`json_valid`), and slug/key formats. Bad data is rejected by the database even if the application is bypassed.
 - **Foreign keys** with deliberate `ON DELETE` behavior: `CASCADE` for tag links and section fields, `SET NULL` for photos, receipts and linked contacts.
-- **Indexes** match the access paths, for example composite `(category_id, spent_on)` for filtered date ranges. You can check this with `EXPLAIN QUERY PLAN` in the console.
+- **Indexes** match the access paths, for example composite `(category_id, spent_on)` for filtered date ranges. Every foreign-key child column has an index, which SQLite doesn't create on its own. Month filters are written as half-open ranges (`spent_on >= '2026-03-01' AND spent_on < '2026-04-01'`) rather than `substr()`, so the date index is used. A test asserts this with `EXPLAIN QUERY PLAN`.
+- **Search index maintenance** keys each FTS row by a deterministic rowid (`id * 8 + kind`), so triggers update it through a b-tree lookup instead of scanning the index. Bulk imports stay linear rather than quadratic.
+- **Schema changes** follow SQLite's table-rebuild procedure (create, copy, drop, rename) where `ALTER TABLE` can't change a `CHECK` constraint. Migrations re-check the version under the write lock, so two processes starting at once don't apply the same migration twice.
 - **Views** (`v_contacts`, `v_expenses`, `v_monthly_spend`) hide the joins and aggregate tags with `json_group_array`.
 - **Triggers** maintain `updated_at`, the FTS index, and the audit log. The FTS and audit triggers are declared `UPDATE OF <data columns>` so the `updated_at` bookkeeping write doesn't double-fire them.
 - **Custom sections** use a typed field registry plus JSON documents rather than runtime DDL. Records are filtered and sorted through `json_extract`, with field keys allow-listed before they reach a JSON path.
@@ -89,12 +94,15 @@ datavault/
 - The server binds to `127.0.0.1`. It checks the **Host header** against DNS rebinding and requires a custom **`X-DataVault` header** on writes, which a cross-site form can't send (CSRF protection). It also sends a strict **CSP**.
 - The SQL console has **four layers** of protection: a `mode=ro` connection, `PRAGMA query_only`, an **authorizer callback** that allows only read operations and informational PRAGMAs, and a **progress handler** that cancels long queries. A row cap bounds memory.
 - All user values are bound parameters. Identifiers that can't be bound (sort columns, JSON paths) go through allow-lists, and free-text search is re-quoted so it can't inject FTS5 operators.
-- Uploads are verified with Pillow and capped in size and pixel count. Restores are protected against zip-slip.
+- **Formulas are never `eval()`'d.** They are parsed with Python's `ast` module and evaluated by walking a whitelist of node types. There is no attribute access, subscripting, lambda or comprehension, and expression size, exponents and text growth are all capped.
+- **CSV exports neutralize formula injection.** A cell such as `=HYPERLINK(...)` is prefixed so Excel or Sheets won't execute it, while real numbers like `-12.50` are left intact.
+- Uploads are verified with Pillow and fully decoded before they touch disk, so a truncated file leaves no orphan. Size and pixel count are capped. Restores are checked against zip-slip and integrity-checked before the live database is replaced.
+- Bad input of any kind (`NaN` amounts, malformed query params, non-scalar JSON) returns a 400 with field-level messages, never a 500. `/api` errors are always JSON.
 
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q     # 46 tests
+.venv/bin/python -m pytest -q     # 116 tests
 ```
 
 The tests cover the following:
@@ -110,6 +118,19 @@ The tests cover the following:
 - vCard round-trip with escaping
 - backup and restore
 - HTTP CSRF and error contracts
+- the formula engine: values, blanks, cycles, and **injection attempts** such as `__import__`, attribute access and lambdas
+- regression tests for every bug found in a code audit:
+  - `NaN` and `Infinity` amounts
+  - Unicode stored inside JSON documents
+  - duplicate re-imports
+  - CSV formula injection
+  - overflowing QR payloads
+  - orphaned files from truncated uploads
+  - backup filename collisions
+  - restoring a file that isn't a database
+  - the migration race
+  - data paths containing spaces, `?` or `#`
+  - query plans that must use an index
 
 ## Running as a service
 

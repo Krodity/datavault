@@ -28,6 +28,11 @@ KINDS = {
 # python-barcode class names
 _BARCODE_CLS = {"ean13": "ean13", "ean8": "ean8", "upca": "upca", "code128": "code128", "code39": "code39", "isbn13": "isbn13"}
 # pyzbar symbology -> our kind
+# friendly spellings accepted from CSV imports / API callers
+KIND_ALIASES = {"qrcode": "qr", "ean": "ean13", "ean-13": "ean13", "ean-8": "ean8", "upc": "upca", "upc-a": "upca",
+                "code-128": "code128", "code-39": "code39", "isbn": "isbn13", "isbn-13": "isbn13"}
+QR_MAX_BYTES = 2331  # byte-mode capacity of a version-40 QR at error-correction level M
+MAX_DECODE_PX = 2400  # downscale huge photos before the (multi-pass) decode
 _ZBAR_KIND = {"QRCODE": "qr", "EAN13": "ean13", "EAN8": "ean8", "UPCA": "upca", "CODE128": "code128",
               "CODE39": "code39", "ISBN13": "isbn13"}
 
@@ -38,12 +43,21 @@ def _gs1_check_digit(digits: str) -> str:
     return str((10 - total % 10) % 10)
 
 
-def normalize_payload(kind: str, payload: str) -> str:
+def normalize_kind(kind) -> str:
+    k = str(kind or "qr").strip().lower().replace(" ", "").replace("_", "")
+    k = KIND_ALIASES.get(k, k)
+    if k not in KINDS:
+        raise ValidationError({"kind": f"must be one of {', '.join(KINDS)}"})
+    return k
+
+
+def normalize_payload(kind: str, payload) -> str:
     """Validate a payload for its symbology and return the canonical form
     (check digit appended/verified for the numeric ones)."""
-    if kind not in KINDS:
-        raise ValidationError({"kind": f"must be one of {', '.join(KINDS)}"})
-    p = (payload or "").strip()
+    kind = normalize_kind(kind)
+    if isinstance(payload, (dict, list)):
+        raise ValidationError({"payload": "must be text"})
+    p = ("" if payload is None else str(payload)).strip()
     if not p:
         raise ValidationError({"payload": "is required"})
     lengths = {"ean13": 13, "ean8": 8, "upca": 12, "isbn13": 13}
@@ -67,8 +81,8 @@ def normalize_payload(kind: str, payload: str) -> str:
             raise ValidationError({"payload": "Code 128 supports printable ASCII only"})
         if len(p) > 80:
             raise ValidationError({"payload": "is too long for a Code 128 barcode (80 max)"})
-    elif kind == "qr" and len(p.encode()) > 2900:
-        raise ValidationError({"payload": "is too long for a QR code"})
+    elif kind == "qr" and len(p.encode()) > QR_MAX_BYTES:
+        raise ValidationError({"payload": f"is too long for a QR code ({QR_MAX_BYTES} bytes max)"})
     return p
 
 
@@ -103,8 +117,11 @@ def decode_image(data: bytes) -> list[dict]:
 
     try:
         img = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
-    except (UnidentifiedImageError, OSError):
+        img.load()
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError, ValueError):
         raise ValidationError({"file": "is not a readable image"}) from None
+    if max(img.size) > MAX_DECODE_PX:  # 7 decode passes over a 48 MP photo is slow and pointless
+        img.thumbnail((MAX_DECODE_PX, MAX_DECODE_PX))
     gray = img.convert("L")
     attempts = [img.convert("RGB"), gray, ImageOps.autocontrast(gray)]
     if max(gray.size) < 800:
@@ -171,7 +188,7 @@ def list_codes(conn, *, q="", kind="", limit=100, offset=0) -> dict:
         params["q"] = _like(q)
     if kind:
         where.append("kind = :kind")
-        params["kind"] = kind
+        params["kind"] = normalize_kind(kind)
     w = ("WHERE " + " AND ".join(where)) if where else ""
     total = conn.execute(f"SELECT COUNT(*) FROM codes {w}", params).fetchone()[0]
     items = rows(conn.execute(f"SELECT * FROM codes {w} ORDER BY updated_at DESC, id DESC LIMIT {limit} OFFSET {offset}", params))
@@ -188,9 +205,13 @@ def get_code(conn, code_id: int) -> dict:
 def save_code(conn, data: dict) -> tuple[dict, bool]:
     """Insert, or — if this exact (kind, payload) already exists — bump its
     scan counter and return it (an UPSERT keyed on the UNIQUE constraint)."""
-    kind = (data.get("kind") or "qr").lower()
+    kind = normalize_kind(data.get("kind"))
     payload = normalize_payload(kind, data.get("payload", ""))
     source = data.get("source") or "generated"
+    try:
+        label, notes = v.text(200)(data.get("label")), v.text(5000)(data.get("notes"))
+    except ValueError as e:
+        raise ValidationError({"label": str(e)}) from None
     if source not in ("generated", "scanned", "imported"):
         raise ValidationError({"source": "invalid"})
     with transaction(conn):
@@ -201,8 +222,7 @@ def save_code(conn, data: dict) -> tuple[dict, bool]:
             ON CONFLICT(kind, payload) DO UPDATE SET
                 scan_count = codes.scan_count + excluded.scan_count,
                 label = CASE WHEN codes.label = '' THEN excluded.label ELSE codes.label END
-            RETURNING id""", {"kind": kind, "payload": payload, "label": v.text(200)(data.get("label")),
-                              "notes": v.text(5000)(data.get("notes")), "source": source,
+            RETURNING id""", {"kind": kind, "payload": payload, "label": label, "notes": notes, "source": source,
                               "sc": 1 if source == "scanned" else 0}).fetchone()
     return get_code(conn, row[0]), existed is None
 
@@ -211,9 +231,15 @@ def update_code(conn, code_id: int, data: dict) -> dict:
     clean = {}
     for k, n in (("label", 200), ("notes", 5000)):
         if k in data:
-            clean[k] = v.text(n)(data[k])
+            try:
+                clean[k] = v.text(n)(data[k])
+            except ValueError as e:
+                raise ValidationError({k: str(e)}) from None
     with transaction(conn):
-        _update(conn, "codes", code_id, clean) if clean else get_code(conn, code_id)
+        if clean:
+            _update(conn, "codes", code_id, clean)
+        else:
+            get_code(conn, code_id)
     return get_code(conn, code_id)
 
 

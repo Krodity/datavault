@@ -5,6 +5,7 @@ command all reject the same bad data with the same messages.
 """
 from __future__ import annotations
 
+import math
 import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -29,9 +30,18 @@ class NotFound(LookupError):
 # Each takes a raw value (str from CSV/form, or JSON-typed) and returns the
 # DB value or raises ValueError with a human message.
 
+MAX_CENTS = 10 ** 15  # $10 trillion; keeps values far inside SQLite's 64-bit INTEGER
+
+
+def _scalar(v):
+    if isinstance(v, (dict, list, tuple, set)):
+        raise ValueError("must be a single value, not a list or object")
+    return v
+
+
 def text(max_len: int = 2000) -> Callable[[Any], str]:
     def f(v):
-        s = "" if v is None else str(v).strip()
+        s = "" if v is None else str(_scalar(v)).strip()
         if len(s) > max_len:
             raise ValueError(f"must be at most {max_len} characters")
         return s
@@ -61,22 +71,33 @@ def phone(v) -> str:
     return s
 
 
-DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d.%m.%Y", "%Y/%m/%d", "%b %d %Y", "%B %d %Y", "%d %b %Y")
+# US-style m/d/Y is tried before d.m.Y; ISO always wins.
+DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d.%m.%Y", "%Y/%m/%d", "%Y%m%d", "%b %d %Y", "%B %d %Y", "%d %b %Y")
+MIN_YEAR, MAX_YEAR = 1000, 9999
 
 
 def iso_date(v) -> str | None:
     if v in (None, ""):
         return None
-    if isinstance(v, (date, datetime)):
-        return v.strftime("%Y-%m-%d")
-    s = str(v).strip().replace(",", "")
+    if isinstance(v, datetime):
+        d = v.date()
+    elif isinstance(v, date):
+        d = v
+    else:
+        d = _parse_date(str(_scalar(v)).strip().replace(",", ""))
+    if not MIN_YEAR <= d.year <= MAX_YEAR:
+        raise ValueError(f"year must be between {MIN_YEAR} and {MAX_YEAR}")
+    return d.isoformat()  # always zero-padded YYYY-MM-DD (strftime isn't, for years < 1000)
+
+
+def _parse_date(s: str) -> date:
     for fmt in DATE_FORMATS:
         try:
-            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(s, fmt).date()
         except ValueError:
             continue
     try:  # full ISO timestamps
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
     except ValueError:
         raise ValueError("is not a recognised date (use YYYY-MM-DD)") from None
 
@@ -86,19 +107,31 @@ def cents(v) -> int:
     0.1 + 0.2 never becomes 30.000000000000004 cents."""
     if v in (None, ""):
         raise ValueError("is required")
-    if isinstance(v, int) and not isinstance(v, bool):
-        return v * 100
-    s = str(v).strip().replace(",", "").replace("$", "").replace("€", "").replace("£", "")
+    if isinstance(v, bool):
+        raise ValueError("is not a valid amount")
+    if isinstance(v, int):
+        return _bounded(abs(v) * 100)
+    s = str(_scalar(v)).strip().replace(",", "").replace("$", "").replace("€", "").replace("£", "")
     neg = s.startswith("(") and s.endswith(")")
     s = s.strip("()")
     try:
         d = Decimal(s)
     except InvalidOperation:
         raise ValueError("is not a valid amount") from None
+    if not d.is_finite():  # Decimal accepts "NaN" and "Infinity"
+        raise ValueError("is not a valid amount")
     if neg:
         d = -d
     d = abs(d)  # bank exports often write debits as negatives
-    return int((d * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    if d >= MAX_CENTS:
+        raise ValueError("is too large")
+    return _bounded(int((d * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)))
+
+
+def _bounded(c: int) -> int:
+    if c >= MAX_CENTS * 100:
+        raise ValueError("is too large")
+    return c
 
 
 def optional_cents(v) -> int | None:
@@ -110,13 +143,20 @@ def number(v) -> float | int | None:
         return None
     if isinstance(v, bool):
         raise ValueError("is not a number")
-    if isinstance(v, (int, float)):
+    if isinstance(v, int):
+        if abs(v) >= 2 ** 63:
+            raise ValueError("is too large")
         return v
-    try:
-        f = float(str(v).replace(",", ""))
-    except ValueError:
-        raise ValueError("is not a number") from None
-    return int(f) if f.is_integer() else f
+    if isinstance(v, float):
+        f = v
+    else:
+        try:
+            f = float(str(_scalar(v)).replace(",", ""))
+        except ValueError:
+            raise ValueError("is not a number") from None
+    if not math.isfinite(f):  # NaN/inf would make the stored JSON invalid
+        raise ValueError("must be a finite number")
+    return int(f) if f.is_integer() and abs(f) < 2 ** 53 else f
 
 
 def boolean(v) -> int:
@@ -124,7 +164,7 @@ def boolean(v) -> int:
         return int(v)
     if v in (None, ""):
         return 0
-    s = str(v).strip().lower()
+    s = str(_scalar(v)).strip().lower()
     if s in ("1", "true", "yes", "y", "on", "t", "x"):
         return 1
     if s in ("0", "false", "no", "n", "off", "f"):
@@ -149,11 +189,13 @@ def currency(v) -> str:
 def fk(v) -> int | None:
     if v in (None, "", 0, "0"):
         return None
+    if isinstance(v, bool):
+        raise ValueError("must be an id")
     try:
-        i = int(v)
-    except (TypeError, ValueError):
+        i = int(_scalar(v))
+    except (TypeError, ValueError, OverflowError):
         raise ValueError("must be an id") from None
-    if i < 1:
+    if not 1 <= i < 2 ** 63:
         raise ValueError("must be a positive id")
     return i
 

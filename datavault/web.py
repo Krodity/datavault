@@ -9,8 +9,9 @@ from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, Response, abort, g, jsonify, request, send_file, send_from_directory
+from werkzeug.exceptions import HTTPException
 
-from . import codes, media, repo, transfer
+from . import codes, formulas, media, repo, transfer
 from .config import Config
 from .db import connect, migrate
 from .query import EXAMPLES, QueryRunner
@@ -72,6 +73,18 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
     @app.errorhandler(413)
     def _too_big(_e):
         return jsonify(error="too_large", message="upload exceeds 200 MB"), 413
+
+    @app.errorhandler(HTTPException)
+    def _http(e):
+        # API clients always get JSON, never an HTML error page
+        if request.path.startswith("/api/"):
+            return jsonify(error=e.name.lower().replace(" ", "_"), message=e.description), e.code
+        return e
+
+    @app.errorhandler(Exception)
+    def _unexpected(e):
+        app.logger.exception("unhandled error on %s %s", request.method, request.path)
+        return jsonify(error="internal", message="unexpected server error — see the server log"), 500
 
     def body() -> dict:
         data = request.get_json(silent=True)
@@ -285,11 +298,11 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
 
     @app.get("/api/codes/preview")
     def codes_preview():
-        kind = request.args.get("kind", "qr")
+        kind = codes.normalize_kind(request.args.get("kind", "qr"))
         payload = codes.normalize_payload(kind, request.args.get("payload", ""))
         fmt = "svg" if request.args.get("format") == "svg" else "png"
         data, mime = codes.render(kind, payload, fmt)
-        return Response(data, mimetype=mime, headers={"X-Payload": payload.encode("ascii", "replace").decode()})
+        return Response(data, mimetype=mime, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/codes/decode")
     def codes_decode():
@@ -365,6 +378,34 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
     def records_get(rid):
         return jsonify(repo.get_record(db(), rid))
 
+    @app.post("/api/sections/<int:sid>/recalculate")
+    def sections_recalc(sid):
+        repo.get_section(db(), sid)
+        return jsonify(changed=repo.recalculate_section(db(), sid))
+
+    @app.get("/api/formula/functions")
+    def formula_functions():
+        return jsonify(formulas.function_help())
+
+    @app.post("/api/formula/check")
+    def formula_check():
+        """Validate one formula against a (possibly unsaved) field list and
+        evaluate it on sample values, for live feedback in the field builder."""
+        b = body()
+        fields = b.get("fields") or []
+        if not isinstance(fields, list):
+            raise ValidationError({"fields": "must be a list"})
+        keys = {repo.v.field_key(str(f.get("key") or f.get("label") or "")) for f in fields if isinstance(f, dict)}
+        key = repo.v.field_key(str(b.get("key") or b.get("label") or "result"))
+        try:
+            f = formulas.compile_formula(key, b.get("expr", ""), b.get("result", "number"), keys - {key})
+        except formulas.FormulaError as e:
+            return jsonify(ok=False, error=str(e))
+        sample = b.get("sample") if isinstance(b.get("sample"), dict) else {}
+        env = {k: (formulas._num(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else val)
+               for k, val in sample.items() if k in keys}
+        return jsonify(ok=True, refs=sorted(f.refs), volatile=f.volatile, value=formulas.evaluate(f, env))
+
     @app.patch("/api/records/<int:rid>")
     def records_update(rid):
         return jsonify(repo.update_record(db(), rid, body()))
@@ -384,11 +425,7 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
     def query_csv():
         b = body()
         res = runner.run(b.get("sql", ""), b.get("params"))
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(res["columns"])
-        w.writerows(res["rows"])
-        return Response(buf.getvalue(), mimetype="text/csv",
+        return Response(transfer.write_csv(res["columns"], res["rows"]), mimetype="text/csv",
                         headers={"Content-Disposition": 'attachment; filename="query.csv"'})
 
     @app.get("/api/schema")
@@ -422,7 +459,10 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
         dry = request.form.get("dry_run") == "1"
         if entity == "vcard":
             return jsonify(transfer.import_vcards(db(), text, dry_run=dry))
-        mapping = json.loads(request.form["mapping"]) if request.form.get("mapping") else None
+        try:
+            mapping = json.loads(request.form["mapping"]) if request.form.get("mapping") else None
+        except json.JSONDecodeError:
+            raise ValidationError({"mapping": "is not valid JSON"}) from None
         return jsonify(transfer.import_csv(db(), entity, text, mapping=mapping, dry_run=dry,
                                            skip_errors=request.form.get("skip_errors") == "1"))
 

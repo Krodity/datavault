@@ -14,7 +14,7 @@ from pathlib import Path
 from . import codes as codes_mod
 from . import repo
 from .config import Config
-from .db import connect, transaction
+from .db import connect
 from .validation import ValidationError
 
 # --------------------------------------------------------------- CSV import
@@ -85,6 +85,28 @@ def _sniff(text: str) -> csv.Dialect:
         return csv.excel
 
 
+def _check_mapping(entity: str, headers: list[str], mapping) -> dict[str, str]:
+    """A user-supplied mapping must be {csv header: known field}, one header per field."""
+    if not isinstance(mapping, dict):
+        raise ValidationError({"mapping": "must be an object of {CSV column: field}"})
+    allowed = set(ALIASES[entity])
+    out, used = {}, set()
+    for h, f in mapping.items():
+        if not f:
+            continue
+        if h not in headers:
+            raise ValidationError({"mapping": f"column {h!r} is not in the file"})
+        if f not in allowed:
+            raise ValidationError({"mapping": f"{f!r} is not a {entity} field"})
+        if f in used:
+            raise ValidationError({"mapping": f"two columns are mapped to {f!r}"})
+        used.add(f)
+        out[h] = f
+    if not out:
+        raise ValidationError({"mapping": "no columns are mapped"})
+    return out
+
+
 def import_csv(conn, entity: str, text: str, *, mapping: dict[str, str] | None = None,
                dry_run: bool = False, skip_errors: bool = False, create_categories: bool = True) -> dict:
     """Import rows atomically. On any invalid row the whole import is rolled
@@ -96,12 +118,17 @@ def import_csv(conn, entity: str, text: str, *, mapping: dict[str, str] | None =
     headers = reader.fieldnames or []
     if not headers:
         raise ValidationError({"file": "has no header row"})
-    mapping = mapping or guess_mapping(entity, headers)
+    mapping = _check_mapping(entity, headers, mapping) if mapping else guess_mapping(entity, headers)
+    if not mapping:
+        raise ValidationError({"file": f"none of the columns look like {entity} fields — map them explicitly"})
     report = {"entity": entity, "mapping": mapping, "unmapped": [h for h in headers if h not in mapping],
               "total": 0, "imported": 0, "skipped": 0, "duplicates": 0, "errors": [], "dry_run": dry_run}
 
     commit = True
     conn.execute("BEGIN IMMEDIATE")
+    # rows that existed before this import; used to skip re-imported expenses
+    # without treating two identical coffees in the *same* file as duplicates
+    ctx = {"max_expense_id": conn.execute("SELECT COALESCE(MAX(id), 0) FROM expenses").fetchone()[0]}
     try:
         for line_no, raw in enumerate(reader, start=2):
             if not any((val or "").strip() for val in raw.values() if isinstance(val, str)):
@@ -110,7 +137,7 @@ def import_csv(conn, entity: str, text: str, *, mapping: dict[str, str] | None =
             row = {mapping[h]: (raw.get(h) or "").strip() for h in mapping if mapping[h]}
             conn.execute("SAVEPOINT row")
             try:
-                created = _import_row(conn, entity, row, create_categories)
+                created = _import_row(conn, entity, row, create_categories, ctx)
                 conn.execute("RELEASE row")
                 report["imported" if created else "duplicates"] += 1
             except (ValidationError, sqlite3.IntegrityError) as e:
@@ -135,7 +162,7 @@ def import_csv(conn, entity: str, text: str, *, mapping: dict[str, str] | None =
     return report
 
 
-def _import_row(conn, entity: str, row: dict, create_categories: bool) -> bool:
+def _import_row(conn, entity: str, row: dict, create_categories: bool, ctx: dict) -> bool:
     if entity == "contacts":
         full = row.pop("_full_name", "")
         if full and not row.get("first_name"):
@@ -155,10 +182,15 @@ def _import_row(conn, entity: str, row: dict, create_categories: bool) -> bool:
         cat = row.pop("category", "")
         row["category_id"] = repo.category_id_for(conn, cat, create=create_categories)
         clean = repo._expense_clean(row)
+        if conn.execute("""SELECT 1 FROM expenses WHERE id <= ? AND spent_on = ? AND amount_cents = ?
+                             AND merchant = ? COLLATE NOCASE AND description = ? LIMIT 1""",
+                        (ctx["max_expense_id"], clean["spent_on"], clean["amount_cents"],
+                         clean.get("merchant", ""), clean.get("description", ""))).fetchone():
+            return False  # already imported from an earlier run of the same statement
         repo._insert(conn, "expenses", clean)
         return True
     if entity == "codes":
-        kind = (row.get("kind") or "qr").lower().replace("-", "").replace(" ", "")
+        kind = codes_mod.normalize_kind(row.get("kind"))
         payload = codes_mod.normalize_payload(kind, row.get("payload", ""))
         cur = conn.execute("""INSERT INTO codes (kind, payload, label, notes, source) VALUES (?, ?, ?, ?, 'imported')
                               ON CONFLICT(kind, payload) DO NOTHING""",
@@ -184,17 +216,36 @@ EXPORT_QUERIES = {
 }
 
 
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+_NUMBER_RE = re.compile(r"^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$")
+
+
+def safe_cell(value):
+    """Neutralise CSV/formula injection: a cell like =HYPERLINK(...) would be
+    executed by Excel/Sheets when the export is opened, so text starting with a
+    formula character is prefixed with an apostrophe. Real numbers (-12.50)
+    are left alone."""
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES) and not _NUMBER_RE.match(value):
+        return "'" + value
+    return value
+
+
+def write_csv(columns, data) -> str:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([safe_cell(c) for c in columns])
+    for r in data:
+        w.writerow([safe_cell(c) for c in r])
+    return buf.getvalue()
+
+
 def export_csv(conn, entity: str) -> str:
     if entity.startswith("section:"):
         return _export_section_csv(conn, entity.split(":", 1)[1])
     if entity not in EXPORT_QUERIES:
         raise ValidationError({"entity": f"must be one of {', '.join(EXPORT_QUERIES)} or section:<slug>"})
     cur = conn.execute(EXPORT_QUERIES[entity])
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow([d[0] for d in cur.description])
-    w.writerows(cur)
-    return buf.getvalue()
+    return write_csv([d[0] for d in cur.description], cur)
 
 
 def _export_section_csv(conn, ref: str) -> str:
@@ -204,11 +255,7 @@ def _export_section_csv(conn, ref: str) -> str:
     cols = ", ".join(f"json_extract(data, '$.{k}') AS \"{k}\"" for k in keys)
     cur = conn.execute(f"SELECT id, {cols}, created_at, updated_at FROM section_records WHERE section_id = ? ORDER BY id",
                        (sec["id"],))
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["id", *[f["label"] for f in sec["fields"]], "created_at", "updated_at"])
-    w.writerows(cur)
-    return buf.getvalue()
+    return write_csv(["id", *[f["label"] for f in sec["fields"]], "created_at", "updated_at"], cur)
 
 
 def export_json(conn) -> dict:
@@ -347,8 +394,12 @@ def backup(conn, cfg: Config, include_media: bool = True, label: str = "") -> Pa
     server is running), zipped together with the media files."""
     cfg.ensure_dirs()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    suffix = f"-{re.sub(r'[^a-z0-9-]+', '-', label.lower()).strip('-')}" if label else ""
+    suffix = f"-{re.sub(r'[^a-z0-9-]+', '-', str(label).lower()).strip('-')[:40]}" if label else ""
     out = cfg.backups_dir / f"datavault-{stamp}{suffix}.zip"
+    n = 2
+    while out.exists():  # two backups in the same second must not overwrite each other
+        out = cfg.backups_dir / f"datavault-{stamp}{suffix}-{n}.zip"
+        n += 1
     snap = cfg.backups_dir / f".snapshot-{stamp}.db"
     dest = sqlite3.connect(snap)
     try:
@@ -390,6 +441,23 @@ def list_backups(cfg: Config) -> list[dict]:
     return out
 
 
+def _check_snapshot(path: Path) -> None:
+    try:
+        c = sqlite3.connect(path)
+        try:
+            ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+            has_core = c.execute("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN "
+                                 "('contacts', 'expenses', 'pictures')").fetchone()[0] == 3
+        finally:
+            c.close()
+    except sqlite3.DatabaseError as e:
+        path.unlink(missing_ok=True)
+        raise ValidationError({"archive": f"datavault.db is not a valid SQLite database ({e})"}) from None
+    if ok != "ok" or not has_core:
+        path.unlink(missing_ok=True)
+        raise ValidationError({"archive": "datavault.db failed its integrity check or is not a DataVault database"})
+
+
 def restore(cfg: Config, archive: Path) -> None:
     """Replace the live DB + media with a backup. Run with the server stopped.
     The current state is itself backed up first, so a restore is undoable."""
@@ -408,6 +476,7 @@ def restore(cfg: Config, archive: Path) -> None:
             live.close()
         tmp = cfg.db_path.with_suffix(".restore")
         tmp.write_bytes(z.read("datavault.db"))
+        _check_snapshot(tmp)  # never swap in a file we can't open
         for ext in ("-wal", "-shm"):
             Path(str(cfg.db_path) + ext).unlink(missing_ok=True)
         tmp.replace(cfg.db_path)
