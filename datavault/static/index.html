@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DataVault</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><ellipse cx='16' cy='10' rx='9' ry='3.5' fill='none' stroke='white' stroke-width='2.2'/><path d='M7 10v12c0 2 4 3.5 9 3.5s9-1.5 9-3.5V10M7 16c0 2 4 3.5 9 3.5s9-1.5 9-3.5' fill='none' stroke='white' stroke-width='2.2'/></svg>">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#/">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="var(--accent)"/><ellipse cx="16" cy="10" rx="9" ry="3.5" fill="none" stroke="white" stroke-width="2.2"/><path d="M7 10v12c0 2 4 3.5 9 3.5s9-1.5 9-3.5V10M7 16c0 2 4 3.5 9 3.5s9-1.5 9-3.5" fill="none" stroke="white" stroke-width="2.2"/></svg>
+        <span>DataVault</span>
+      </a>
+      <nav class="nav">
+        <a href="#/" data-nav="dashboard"><i>◧</i>Dashboard</a>
+        <a href="#/contacts" data-nav="contacts"><i>☺</i>Contacts</a>
+        <a href="#/pictures" data-nav="pictures"><i>▣</i>Pictures</a>
+        <a href="#/expenses" data-nav="expenses"><i>$</i>Expenses</a>
+        <a href="#/codes" data-nav="codes"><i>▦</i>Codes</a>
+        <div class="nav-head">Sections <button class="icon-btn" id="new-section" title="New section">＋</button></div>
+        <div id="section-nav"></div>
+        <div class="nav-head">Data</div>
+        <a href="#/sql" data-nav="sql"><i>›_</i>SQL Console</a>
+        <a href="#/data" data-nav="data"><i>⇅</i>Import · Export · Backup</a>
+      </nav>
+      <div class="sidebar-foot">
+        <button class="ghost small" id="theme-toggle" title="Toggle theme">◐ Theme</button>
+        <span id="db-meta" class="muted small"></span>
+      </div>
+    </aside>
+    <div class="main">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="menu-btn" aria-label="Menu">☰</button>
+        <div class="search-wrap">
+          <input id="global-search" type="search" placeholder="Search everything…  ( / )" autocomplete="off">
+          <div id="search-results" class="search-results" hidden></div>
+        </div>
+      </header>
+      <main id="view" class="view"></main>
+    </div>
+  </div>
+  <div id="modal-root"></div>
+  <div id="toasts" class="toasts"></div>
+</body>
+</html>

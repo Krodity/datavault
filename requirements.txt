@@ -1,0 +1,5 @@
+flask>=3.1
+pillow>=11
+qrcode>=8
+python-barcode>=0.15
+pyzbar>=0.1.9

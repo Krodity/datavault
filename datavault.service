@@ -1,0 +1,11 @@
+[Unit]
+Description=DataVault personal database (http://127.0.0.1:8800)
+After=network.target
+
+[Service]
+WorkingDirectory=%h/Projects/datavault
+ExecStart=%h/Projects/datavault/.venv/bin/python -m datavault serve --host 127.0.0.1 --port 8800
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
