@@ -187,8 +187,19 @@ def update_contact(conn, contact_id: int, data: dict) -> dict:
         else:
             get_contact(conn, contact_id)
         if "tags" in data:
+            before = _tag_names(conn, contact_id)
             _set_contact_tags(conn, contact_id, data["tags"])
+            after = _tag_names(conn, contact_id)
+            if before != after:  # tags live in a join table, so the row trigger can't see this change
+                conn.execute("""INSERT INTO audit_log (table_name, row_id, action, old_data, new_data)
+                                VALUES ('contacts', ?, 'UPDATE', json_object('tags', json(?)), json_object('tags', json(?)))""",
+                             (contact_id, json.dumps(before), json.dumps(after)))
     return get_contact(conn, contact_id)
+
+
+def _tag_names(conn, contact_id: int) -> list[str]:
+    return [r[0] for r in conn.execute("""SELECT t.name FROM contact_tags ct JOIN tags t ON t.id = ct.tag_id
+                                          WHERE ct.contact_id = ? ORDER BY t.name COLLATE NOCASE""", (contact_id,))]
 
 
 def delete_contact(conn, contact_id: int) -> None:
@@ -210,6 +221,45 @@ def find_duplicate_contacts(conn) -> list[dict]:
         )
         SELECT match_on, k AS value, COUNT(*) AS n, json_group_array(id) AS ids
           FROM keyed GROUP BY match_on, k HAVING COUNT(*) > 1 ORDER BY n DESC"""))
+
+
+MERGE_FILL = ("last_name", "company", "job_title", "email", "phone", "address", "city", "region", "postal_code",
+              "country", "birthday", "website", "photo_id")
+
+
+def merge_contacts(conn, keep_id: int, merge_ids: list) -> dict:
+    """Fold duplicate contacts into one. The kept contact gains any fields it
+    is missing, the union of tags, and every reference to the merged rows
+    (expenses, contact fields in custom sections); then the duplicates go.
+    One transaction, so a failure leaves nothing half-merged."""
+    if not isinstance(merge_ids, list) or not merge_ids:
+        raise ValidationError({"merge_ids": "list the contacts to merge into the kept one"})
+    ids = list(dict.fromkeys(_filter_value("merge_ids", v.fk, i) for i in merge_ids))
+    if keep_id in ids:
+        raise ValidationError({"merge_ids": "can't merge a contact into itself"})
+    contact_fields = conn.execute("SELECT section_id, key FROM section_fields WHERE type = 'contact'").fetchall()
+    with transaction(conn):
+        keep = get_contact(conn, keep_id)
+        for mid in ids:
+            other = get_contact(conn, mid)
+            fill = {f: other[f] for f in MERGE_FILL if keep.get(f) in (None, "") and other.get(f) not in (None, "")}
+            if other["notes"] and other["notes"] not in keep["notes"]:
+                fill["notes"] = (keep["notes"] + "\n\n" + other["notes"]).strip()[:10000]
+            if other["favorite"] and not keep["favorite"]:
+                fill["favorite"] = 1
+            if fill:
+                _update(conn, "contacts", keep_id, fill)
+            conn.execute("""INSERT OR IGNORE INTO contact_tags (contact_id, tag_id)
+                            SELECT ?, tag_id FROM contact_tags WHERE contact_id = ?""", (keep_id, mid))
+            conn.execute("UPDATE expenses SET contact_id = ? WHERE contact_id = ?", (keep_id, mid))
+            for sf in contact_fields:
+                path = f"$.{sf['key']}"  # bound as a parameter, never spliced into SQL
+                conn.execute("""UPDATE section_records SET data = json_set(data, ?, ?)
+                                 WHERE section_id = ? AND json_extract(data, ?) = ?""",
+                             (path, keep_id, sf["section_id"], path, mid))
+            _delete(conn, "contacts", mid)
+            keep = get_contact(conn, keep_id)
+    return keep
 
 
 # =============================================================== expenses
@@ -359,6 +409,44 @@ def expense_summary(conn, month: str | None = None, months: Any = 12) -> dict:
                (SELECT COALESCE(SUM(monthly_budget_cents), 0) FROM expense_categories) AS budget_cents
           FROM expenses WHERE spent_on >= :start AND spent_on < :end""", {"start": start, "end": end})
     return {"month": month, "totals": totals, "trend": trend, "by_category": by_category, "top_merchants": top_merchants}
+
+
+def recurring_charges(conn, months: Any = 12) -> dict:
+    """Detect subscriptions: merchants charged in at least 3 months, mostly in
+    consecutive months (LAG window function), with a near-constant amount."""
+    try:
+        months = max(3, min(int(months), 36))
+    except (TypeError, ValueError):
+        raise ValidationError({"months": "must be an integer"}) from None
+    items = rows(conn.execute("""
+        WITH monthly AS (
+            SELECT merchant, substr(spent_on, 1, 7) AS month, SUM(amount_cents) AS cents,
+                   COUNT(*) AS charges, MAX(spent_on) AS last_on
+              FROM expenses
+             WHERE merchant <> '' AND spent_on >= date('now', 'localtime', 'start of month', :back)
+             GROUP BY merchant COLLATE NOCASE, month
+        ),
+        seq AS (
+            SELECT *, LAG(month) OVER (PARTITION BY merchant COLLATE NOCASE ORDER BY month) AS prev_month
+              FROM monthly
+        )
+        SELECT merchant,
+               COUNT(*) AS months_charged,
+               SUM(prev_month = strftime('%Y-%m', date(month || '-01', '-1 month'))) AS consecutive,
+               CAST(ROUND(AVG(cents)) AS INTEGER) AS avg_cents,
+               MIN(cents) AS min_cents, MAX(cents) AS max_cents,
+               MAX(last_on) AS last_charge,
+               date(MAX(last_on), '+1 month') AS next_expected,
+               CAST(ROUND(AVG(cents)) AS INTEGER) * 12 AS yearly_cents
+          FROM seq
+         GROUP BY merchant COLLATE NOCASE
+        HAVING COUNT(*) >= 3
+           AND MAX(charges) = 1                                   -- one charge per month
+           AND SUM(prev_month = strftime('%Y-%m', date(month || '-01', '-1 month'))) >= COUNT(*) - 2
+           AND (MAX(cents) - MIN(cents)) <= 0.15 * AVG(cents)     -- stable price
+         ORDER BY avg_cents DESC""", {"back": f"-{months - 1} months"}))
+    return {"items": items, "monthly_cents": sum(i["avg_cents"] for i in items),
+            "yearly_cents": sum(i["yearly_cents"] for i in items)}
 
 
 def list_categories(conn) -> list[dict]:

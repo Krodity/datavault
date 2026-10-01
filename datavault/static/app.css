@@ -250,3 +250,11 @@ video.scanner { width: 100%; border-radius: 10px; background: #000; max-height: 
 .fx-funcs code:hover, .formula-help code.click:hover { border-color: var(--accent); color: var(--accent); }
 .computed { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
 tfoot td { background: var(--panel-2); border-bottom: none; position: sticky; bottom: 0; }
+
+/* ---------- history */
+.hist { border-bottom: 1px solid var(--border); padding: 10px 0; }
+.hist:last-child { border-bottom: none; }
+.hist-head { display: flex; gap: 10px; align-items: center; margin-bottom: 6px; }
+table.diff td { padding: 4px 8px; border: none; font-size: 13px; vertical-align: top; }
+table.diff td.old { color: var(--danger); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--danger) 50%, transparent); }
+table.diff td.new { color: var(--ok); }

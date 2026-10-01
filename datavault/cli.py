@@ -144,7 +144,9 @@ def cmd_backup(cfg, a):
     p = transfer.backup(conn, cfg, include_media=not a.no_media, label=a.label or "")
     print(f"backup written: {p} ({p.stat().st_size / 1e6:.2f} MB)")
     if a.keep:
-        old = sorted(cfg.backups_dir.glob("datavault-*.zip"), reverse=True)[a.keep:]
+        # prune only backups with the same label: a nightly "auto" job must
+        # never delete a backup you made by hand (or a pre-restore safety copy)
+        old = transfer.backups_with_label(cfg, a.label or "")[a.keep:]
         for o in old:
             o.unlink()
         if old:
@@ -163,6 +165,29 @@ def cmd_restore(cfg, a):
     print(f"restored; schema version {current_version(conn)}, {report['thumbs_rebuilt']} thumbnails rebuilt")
     if report["missing_files"]:
         print(f"warning: {len(report['missing_files'])} picture file(s) missing (backup made with --no-media?)")
+
+
+def cmd_history(cfg, a):
+    from . import history
+    conn = open_db(cfg)
+    if a.prune:
+        print(f"pruned {history.prune(conn, a.prune)} audit entries older than {a.prune} days")
+        return
+    if a.deleted:
+        for d in history.recently_deleted(conn):
+            print(f"audit #{d['audit_id']:<6} {d['table']:<16} id {d['row_id']:<6} {d['at'][:16]}  {d['label']}")
+        return
+    if a.restore:
+        r = history.restore_deleted(conn, a.restore)
+        print(f"restored {r['table']} #{r['id']}" + "".join(f"\n  note: {n}" for n in r["notes"]))
+        return
+    if not (a.table and a.id):
+        print("usage: datavault history TABLE ID | --deleted | --restore AUDIT_ID | --prune DAYS", file=sys.stderr)
+        sys.exit(2)
+    for h in history.history(conn, a.table, a.id):
+        print(f"{h['at'][:19]}  {h['action']}")
+        for c in h["changes"]:
+            print(f"    {c['field']}: {c['old']!r} -> {c['new']!r}")
 
 
 def cmd_add_picture(cfg, a):
@@ -263,6 +288,19 @@ def cmd_seed(cfg, a):
                                        "payment_method": rnd.choice(["Visa", "Debit", "Cash", "Apple Pay"]),
                                        "contact_id": cids[1] if cat == "Bills" and rnd.random() < .1 else None})
             n += 1
+
+    # fixed monthly subscriptions, so the recurring-charge detector has something real to find
+    for merchant, amount, day, cat in [("Netflix", "15.49", 3, "Entertainment"), ("Spotify Premium", "11.99", 9, "Entertainment"),
+                                       ("Planet Fitness", "24.99", 15, "Health"), ("iCloud+", "2.99", 21, "Bills")]:
+        for back in range(8):
+            first = (today.replace(day=1) - timedelta(days=1)).replace(day=1) if back else today.replace(day=1)
+            for _ in range(back - 1):
+                first = (first - timedelta(days=1)).replace(day=1)
+            d = first.replace(day=min(day, 28))
+            if d <= today:
+                repo.create_expense(conn, {"spent_on": d.isoformat(), "amount": amount, "merchant": merchant,
+                                           "category_id": cats[cat], "payment_method": "Visa", "description": "Subscription"})
+                n += 1
 
     for kind, payload, label in [("qr", "https://github.com/Krodity", "GitHub profile"),
                                  ("ean13", "590123412345", "Sample product"),
@@ -383,6 +421,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("archive")
     s.add_argument("-y", "--yes", action="store_true")
     s.set_defaults(fn=cmd_restore)
+
+    s = sub.add_parser("history", help="change history, undelete, audit pruning")
+    s.add_argument("table", nargs="?", help="contacts | expenses | codes | section_records | …")
+    s.add_argument("id", nargs="?", type=int)
+    s.add_argument("--deleted", action="store_true", help="list recently deleted rows")
+    s.add_argument("--restore", type=int, metavar="AUDIT_ID", help="undelete a row")
+    s.add_argument("--prune", type=int, metavar="DAYS", help="drop audit entries older than DAYS")
+    s.set_defaults(fn=cmd_history)
 
     s = sub.add_parser("add-picture", help="ingest image files")
     s.add_argument("files", nargs="+")

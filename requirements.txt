@@ -3,3 +3,4 @@ pillow>=11
 qrcode>=8
 python-barcode>=0.15
 pyzbar>=0.1.9
+pillow-heif>=0.18   # optional: iPhone HEIC photos

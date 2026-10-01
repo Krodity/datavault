@@ -163,7 +163,7 @@ def test_migration_from_v2_preserves_and_reindexes(tmp_path):
     c.execute("INSERT INTO contacts (first_name) VALUES ('Legacy')")
     c.execute("INSERT INTO sections (name, slug) VALUES ('S', 's')")
     c.execute("INSERT INTO section_fields (section_id, key, label, type) VALUES (1, 'a', 'A', 'text')")
-    assert migrate(c) == ["0003_formulas_and_perf"]
+    assert migrate(c)[0] == "0003_formulas_and_perf"  # plus any later migrations
     assert repo.search(c, "legacy")[0]["ref_id"] == 1
     assert c.execute("SELECT key FROM section_fields").fetchone()[0] == "a"
     repo.update_contact(c, 1, {"first_name": "Renamed"})  # rowid-based FTS triggers work

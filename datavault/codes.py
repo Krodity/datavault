@@ -115,6 +115,8 @@ def decode_image(data: bytes) -> list[dict]:
     grayscale/upscaled pass, then rotated passes — phone photos are messy."""
     from pyzbar import pyzbar  # imported lazily: needs the libzbar shared library
 
+    from . import media  # noqa: F401  (registers the HEIC opener for phone photos)
+
     try:
         img = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
         img.load()

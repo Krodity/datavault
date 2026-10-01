@@ -13,7 +13,21 @@ from . import validation as v
 from .repo import _delete, get_picture
 from .validation import ValidationError
 
-ALLOWED = {"JPEG": "jpg", "PNG": "png", "GIF": "gif", "WEBP": "webp", "BMP": "bmp", "TIFF": "tif"}
+try:  # optional: iPhone HEIC/HEIF photos
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HEIF_SUPPORTED = True
+except ImportError:  # pragma: no cover - depends on the environment
+    HEIF_SUPPORTED = False
+
+# Pillow format -> stored extension. Most phone/camera JPEGs open as "MPO"
+# (multi-picture JPEG with an embedded preview), so it must be accepted too.
+ALLOWED = {"JPEG": "jpg", "MPO": "jpg", "PNG": "png", "GIF": "gif", "WEBP": "webp", "BMP": "bmp", "TIFF": "tif",
+           **({"HEIF": "heic"} if HEIF_SUPPORTED else {})}
+MIME = {"MPO": "image/jpeg", "HEIF": "image/heic"}
+# formats every browser can display; anything else gets a JPEG "view" copy
+BROWSER_SAFE = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"}
+VIEW_PX = 2560
 MAX_BYTES = 40 * 1024 * 1024
 THUMB_PX = 480
 Image.MAX_IMAGE_PIXELS = 120_000_000  # refuse decompression bombs
@@ -91,7 +105,7 @@ def ingest(conn, cfg: Config, data: bytes, original_name: str, meta: dict | None
                                       taken_at, camera, title, description, album)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sha256) DO NOTHING RETURNING id""",
-                (sha, stored, Path(original_name or "").name[:255] or stored, Image.MIME.get(img.format, "image/*"),
+                (sha, stored, Path(original_name or "").name[:255] or stored, MIME.get(img.format) or Image.MIME.get(img.format, "image/*"),
                  len(data), w, h, meta.get("taken_at") or taken, camera, meta.get("title", ""),
                  meta.get("description", ""), meta.get("album", ""))).fetchone()
     except BaseException:
@@ -108,6 +122,11 @@ def ingest(conn, cfg: Config, data: bytes, original_name: str, meta: dict | None
 def _thumbnail(img: Image.Image) -> Image.Image:
     thumb = img.copy()
     thumb.thumbnail((THUMB_PX, THUMB_PX))
+    return _thumbnail_mode(thumb)
+
+
+def _thumbnail_mode(thumb: Image.Image) -> Image.Image:
+    """Convert any mode to something JPEG can store (flattening alpha onto white)."""
     if thumb.mode in ("RGB", "L"):
         return thumb
     if thumb.mode in ("RGBA", "LA", "PA") or (thumb.mode == "P" and "transparency" in thumb.info):
@@ -120,11 +139,50 @@ def _thumbnail(img: Image.Image) -> Image.Image:
     return thumb.convert("RGB")
 
 
+def view_path(cfg: Config, sha: str) -> Path:
+    return cfg.thumbs_dir / f"{sha}.view.jpg"
+
+
+def ensure_thumb(cfg: Config, pic: dict) -> Path | None:
+    """Thumbnails are derived data: rebuild one on demand if it's missing
+    (e.g. after a restore, since backups carry originals only)."""
+    t = thumb_path(cfg, pic["sha256"])
+    if t.exists():
+        return t
+    src = media_path(cfg, pic["stored_name"])
+    if not src.exists():
+        return None
+    try:
+        _thumbnail(ImageOps.exif_transpose(Image.open(src))).save(t, "JPEG", quality=82, optimize=True)
+    except (OSError, ValueError):
+        return None
+    return t
+
+
+def ensure_view(cfg: Config, pic: dict) -> tuple[Path, str] | None:
+    """A browser-displayable version: the original when the browser can show
+    it, otherwise a cached JPEG (HEIC, TIFF)."""
+    src = media_path(cfg, pic["stored_name"])
+    if not src.exists():
+        return None
+    if pic["mime"] in BROWSER_SAFE:
+        return src, pic["mime"]
+    out = view_path(cfg, pic["sha256"])
+    if not out.exists():
+        try:
+            img = ImageOps.exif_transpose(Image.open(src))
+            img.thumbnail((VIEW_PX, VIEW_PX))
+            _thumbnail_mode(img).save(out, "JPEG", quality=88, optimize=True)
+        except (OSError, ValueError):
+            return None
+    return out, "image/jpeg"
+
+
 def delete_picture(conn, cfg: Config, pic_id: int) -> None:
     pic = get_picture(conn, pic_id)
     with transaction(conn):
         _delete(conn, "pictures", pic_id)  # FKs null out contact photos / receipts
-    for p in (media_path(cfg, pic["stored_name"]), thumb_path(cfg, pic["sha256"])):
+    for p in (media_path(cfg, pic["stored_name"]), thumb_path(cfg, pic["sha256"]), view_path(cfg, pic["sha256"])):
         p.unlink(missing_ok=True)
 
 

@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, Response, abort, g, jsonify, request, send_file, send_from_directory
 from werkzeug.exceptions import HTTPException
 
-from . import codes, formulas, media, repo, transfer
+from . import codes, formulas, history, media, repo, transfer
 from .config import Config
 from .db import connect, migrate
 from .query import EXAMPLES, QueryRunner
@@ -141,6 +141,10 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
     def contacts_dupes():
         return jsonify(repo.find_duplicate_contacts(db()))
 
+    @app.post("/api/contacts/<int:cid>/merge")
+    def contacts_merge(cid):
+        return jsonify(repo.merge_contacts(db(), cid, body().get("merge_ids")))
+
     @app.get("/api/contacts/<int:cid>")
     def contacts_get(cid):
         return jsonify(repo.get_contact(db(), cid))
@@ -194,6 +198,10 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
     @app.get("/api/expenses/summary")
     def expenses_summary():
         return jsonify(repo.expense_summary(db(), request.args.get("month"), request.args.get("months", 12)))
+
+    @app.get("/api/expenses/recurring")
+    def expenses_recurring():
+        return jsonify(repo.recurring_charges(db(), request.args.get("months", 12)))
 
     @app.get("/api/expenses/<int:eid>")
     def expenses_get(eid):
@@ -265,12 +273,14 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
     def media_file(pid, kind):
         pic = repo.get_picture(db(), pid)
         if kind == "thumb":
-            path, mime = media.thumb_path(cfg, pic["sha256"]), "image/jpeg"
+            path, mime = media.ensure_thumb(cfg, pic), "image/jpeg"
+        elif kind == "view":
+            path, mime = media.ensure_view(cfg, pic) or (None, None)
         elif kind == "file":
             path, mime = media.media_path(cfg, pic["stored_name"]), pic["mime"]
         else:
             abort(404)
-        if not path.exists():
+        if path is None or not path.exists():
             abort(404)
         # content-addressed, so it can be cached forever
         return send_file(path, mimetype=mime, download_name=pic["original_name"],
@@ -469,14 +479,15 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
     @app.post("/api/import/<entity>/headers")
     def import_headers(entity):
         f = request.files.get("file")
-        if not f or entity not in transfer.ALIASES:
-            raise ValidationError("upload a CSV for contacts, expenses or codes")
+        if not f:
+            raise ValidationError({"file": "no file uploaded"})
+        aliases = transfer.aliases_for(db(), entity)
         text = f.read().decode("utf-8-sig", errors="replace")
         reader = csv.reader(io.StringIO(text), dialect=transfer._sniff(text))
         headers = next(reader, [])
         sample = [r for _, r in zip(range(3), reader)]
-        return jsonify(headers=headers, sample=sample, guess=transfer.guess_mapping(entity, headers),
-                       fields=[k for k in transfer.ALIASES[entity] if not k.startswith("_")] + (
+        return jsonify(headers=headers, sample=sample, guess=transfer.guess_mapping(entity, headers, aliases),
+                       fields=[k for k in aliases if not k.startswith("_")] + (
                            ["_full_name"] if entity == "contacts" else []))
 
     @app.get("/api/export/<path:name>")
@@ -513,6 +524,32 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
             abort(404)
         return send_from_directory(cfg.backups_dir, name, as_attachment=True)
 
+    # ------------------------------------------------------ history/undo
+    @app.get("/api/history/<table>/<int:row_id>")
+    def history_get(table, row_id):
+        return jsonify(history.history(db(), table, row_id))
+
+    @app.get("/api/deleted")
+    def deleted_list():
+        return jsonify(history.recently_deleted(db()))
+
+    @app.post("/api/deleted/<int:audit_id>/restore")
+    def deleted_restore(audit_id):
+        return jsonify(history.restore_deleted(db(), audit_id))
+
+    # ------------------------------------------------------------ API index
+    @app.get("/api")
+    def api_index():
+        """Every endpoint with its methods and summary — a lightweight API reference."""
+        routes = []
+        for rule in app.url_map.iter_rules():
+            if not rule.rule.startswith(("/api", "/media")):
+                continue
+            fn = app.view_functions[rule.endpoint]
+            doc = (fn.__doc__ or "").strip().split("\n")[0]
+            routes.append({"path": rule.rule, "methods": sorted(rule.methods - {"HEAD", "OPTIONS"}), "summary": doc})
+        return jsonify(sorted(routes, key=lambda r: r["path"]))
+
     # --------------------------------------------------------- maintenance
     @app.post("/api/maintenance/<task>")
     def maintenance(task):
@@ -529,6 +566,9 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
             return jsonify(pages_before=before, pages_after=after)
         if task == "verify-media":
             return jsonify(media.verify_media(conn, cfg))
+        if task == "prune-audit":
+            b = request.get_json(silent=True) or {}
+            return jsonify(deleted=history.prune(conn, b.get("keep_days", 365)))
         abort(404)
 
     return app

@@ -62,9 +62,21 @@ def _norm(h: str) -> str:
     return re.sub(r"[\s_]+", " ", (h or "").strip().lower().lstrip("﻿"))
 
 
-def guess_mapping(entity: str, headers: list[str]) -> dict[str, str]:
+def aliases_for(conn, entity: str) -> dict[str, list[str]]:
+    """Known fields + header spellings for an import target. Custom sections
+    ("section:<slug>") derive theirs from the field labels, so a section's own
+    CSV export re-imports without any manual mapping."""
+    if entity.startswith("section:"):
+        sec = repo.get_section(conn, entity.split(":", 1)[1])
+        return {f["key"]: [_norm(f["label"]), _norm(f["key"])] for f in sec["fields"] if f["type"] != "formula"}
+    if entity not in ALIASES:
+        raise ValidationError({"entity": f"must be one of {', '.join(ALIASES)} or section:<slug>"})
+    return ALIASES[entity]
+
+
+def guess_mapping(entity: str, headers: list[str], aliases: dict | None = None) -> dict[str, str]:
     """header -> field, by exact field name first, then by known alias."""
-    aliases = ALIASES[entity]
+    aliases = aliases or ALIASES[entity]
     mapping, used = {}, set()
     for h in headers:
         n = _norm(h)
@@ -85,11 +97,11 @@ def _sniff(text: str) -> csv.Dialect:
         return csv.excel
 
 
-def _check_mapping(entity: str, headers: list[str], mapping) -> dict[str, str]:
+def _check_mapping(entity: str, headers: list[str], mapping, aliases: dict) -> dict[str, str]:
     """A user-supplied mapping must be {csv header: known field}, one header per field."""
     if not isinstance(mapping, dict):
         raise ValidationError({"mapping": "must be an object of {CSV column: field}"})
-    allowed = set(ALIASES[entity])
+    allowed = set(aliases)
     out, used = {}, set()
     for h, f in mapping.items():
         if not f:
@@ -112,13 +124,13 @@ def import_csv(conn, entity: str, text: str, *, mapping: dict[str, str] | None =
     """Import rows atomically. On any invalid row the whole import is rolled
     back (unless skip_errors), and the report lists every bad row so the user
     can fix the file once rather than one error at a time."""
-    if entity not in ALIASES:
-        raise ValidationError({"entity": f"must be one of {', '.join(ALIASES)}"})
+    aliases = aliases_for(conn, entity)
     reader = csv.DictReader(io.StringIO(text.lstrip("﻿")), dialect=_sniff(text))
     headers = reader.fieldnames or []
     if not headers:
         raise ValidationError({"file": "has no header row"})
-    mapping = _check_mapping(entity, headers, mapping) if mapping else guess_mapping(entity, headers)
+    mapping = (_check_mapping(entity, headers, mapping, aliases) if mapping
+               else guess_mapping(entity, headers, aliases))
     if not mapping:
         raise ValidationError({"file": f"none of the columns look like {entity} fields — map them explicitly"})
     report = {"entity": entity, "mapping": mapping, "unmapped": [h for h in headers if h not in mapping],
@@ -129,6 +141,8 @@ def import_csv(conn, entity: str, text: str, *, mapping: dict[str, str] | None =
     # rows that existed before this import; used to skip re-imported expenses
     # without treating two identical coffees in the *same* file as duplicates
     ctx = {"max_expense_id": conn.execute("SELECT COALESCE(MAX(id), 0) FROM expenses").fetchone()[0]}
+    if entity.startswith("section:"):
+        ctx["section"] = repo.get_section(conn, entity.split(":", 1)[1])
     try:
         for line_no, raw in enumerate(reader, start=2):
             if not any((val or "").strip() for val in raw.values() if isinstance(val, str)):
@@ -196,6 +210,11 @@ def _import_row(conn, entity: str, row: dict, create_categories: bool, ctx: dict
                               ON CONFLICT(kind, payload) DO NOTHING""",
                            (kind, payload, repo.v.text(200)(row.get("label")), repo.v.text(5000)(row.get("notes"))))
         return cur.rowcount > 0
+    if entity.startswith("section:"):
+        sec = ctx["section"]
+        clean = repo._clean_record(conn, sec, row)  # same validation + formulas as the UI
+        repo._insert(conn, "section_records", {"section_id": sec["id"], "data": repo._dumps(clean)})
+        return True
     raise AssertionError(entity)
 
 
@@ -250,9 +269,16 @@ def export_csv(conn, entity: str) -> str:
 
 def _export_section_csv(conn, ref: str) -> str:
     sec = repo.get_section(conn, ref)
-    keys = [f["key"] for f in sec["fields"]]
-    # build the pivot query from allow-listed field keys
-    cols = ", ".join(f"json_extract(data, '$.{k}') AS \"{k}\"" for k in keys)
+    def col(f):
+        # field keys are allow-listed ([a-z0-9_]), so they are safe in the JSON path
+        expr = f"json_extract(data, '$.{f['key']}')"
+        result = f["options"].get("result") if f["type"] == "formula" else f["type"]
+        if result == "money":  # stored as cents; export dollars so the file re-imports correctly
+            expr = f"printf('%.2f', {expr} / 100.0)"
+        elif result == "boolean":
+            expr = f"CASE {expr} WHEN 1 THEN 'yes' WHEN 0 THEN 'no' END"
+        return f"CASE WHEN json_extract(data, '$.{f['key']}') IS NULL THEN NULL ELSE {expr} END AS \"{f['key']}\""
+    cols = ", ".join(col(f) for f in sec["fields"])
     cur = conn.execute(f"SELECT id, {cols}, created_at, updated_at FROM section_records WHERE section_id = ? ORDER BY id",
                        (sec["id"],))
     return write_csv(["id", *[f["label"] for f in sec["fields"]], "created_at", "updated_at"], cur)
@@ -394,7 +420,7 @@ def backup(conn, cfg: Config, include_media: bool = True, label: str = "") -> Pa
     server is running), zipped together with the media files."""
     cfg.ensure_dirs()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    suffix = f"-{re.sub(r'[^a-z0-9-]+', '-', str(label).lower()).strip('-')[:40]}" if label else ""
+    suffix = f"-{label_slug(label)}" if label_slug(label) else ""
     out = cfg.backups_dir / f"datavault-{stamp}{suffix}.zip"
     n = 2
     while out.exists():  # two backups in the same second must not overwrite each other
@@ -423,6 +449,18 @@ def backup(conn, cfg: Config, include_media: bool = True, label: str = "") -> Pa
     finally:
         snap.unlink(missing_ok=True)
     return out
+
+
+def label_slug(label) -> str:
+    return re.sub(r"[^a-z0-9-]+", "-", str(label or "").lower()).strip("-")[:40]
+
+
+def backups_with_label(cfg: Config, label: str = "") -> list[Path]:
+    """Backups carrying exactly this label (none = unlabelled), newest first."""
+    slug = label_slug(label)
+    pat = re.compile(rf"datavault-\d{{8}}-\d{{6}}{'-' + re.escape(slug) if slug else ''}(-\d+)?\.zip")
+    found = [p for p in cfg.backups_dir.glob("datavault-*.zip") if pat.fullmatch(p.name)]
+    return sorted(found, key=lambda p: p.name, reverse=True)
 
 
 def list_backups(cfg: Config) -> list[dict]:
@@ -469,14 +507,14 @@ def restore(cfg: Config, archive: Path) -> None:
         for n in names:  # zip-slip guard
             if n.startswith("/") or ".." in Path(n).parts:
                 raise ValidationError({"archive": f"unsafe path {n!r}"})
+        tmp = cfg.db_path.with_suffix(".restore")
+        tmp.write_bytes(z.read("datavault.db"))
+        _check_snapshot(tmp)  # validate first: never back up + swap for a file we can't open
         if cfg.db_path.exists():
             live = connect(cfg.db_path)
             backup(live, cfg, label="pre-restore")
             live.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             live.close()
-        tmp = cfg.db_path.with_suffix(".restore")
-        tmp.write_bytes(z.read("datavault.db"))
-        _check_snapshot(tmp)  # never swap in a file we can't open
         for ext in ("-wal", "-shm"):
             Path(str(cfg.db_path) + ext).unlink(missing_ok=True)
         tmp.replace(cfg.db_path)

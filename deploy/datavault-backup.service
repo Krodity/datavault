@@ -1,0 +1,9 @@
+[Unit]
+Description=DataVault nightly backup (keeps the last 14 "auto" backups)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/datavault
+ExecStart=%h/Projects/datavault/.venv/bin/python -m datavault backup --label auto --keep 14
+Nice=10
+IOSchedulingClass=idle

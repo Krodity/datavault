@@ -4,7 +4,7 @@ A personal, local-first database app for **contacts, pictures, expenses, barcode
 
 The project is about **moving data in and out correctly**: validating it at the boundary, storing it in a well-constrained schema, querying it efficiently, and getting it back out in standard formats without loss.
 
-![stack](https://img.shields.io/badge/python-3.11+-blue) ![db](https://img.shields.io/badge/SQLite-FTS5%20%7C%20JSON1%20%7C%20WAL-003b57) ![tests](https://img.shields.io/badge/tests-116%20passing-brightgreen)
+![stack](https://img.shields.io/badge/python-3.11+-blue) ![db](https://img.shields.io/badge/SQLite-FTS5%20%7C%20JSON1%20%7C%20WAL-003b57) [![CI](https://github.com/Krodity/datavault/actions/workflows/ci.yml/badge.svg)](https://github.com/Krodity/datavault/actions/workflows/ci.yml) ![tests](https://img.shields.io/badge/tests-134%20passing-brightgreen)
 
 ---
 
@@ -12,17 +12,17 @@ The project is about **moving data in and out correctly**: validating it at the 
 
 | Area | What it does |
 |---|---|
-| **Contacts** | Tags (many-to-many), favorites, photo, birthday reminders, duplicate detection (email / phone / name), vCard import and export, a QR code that adds the contact to a phone |
-| **Pictures** | Content-addressed storage (SHA-256 dedup), EXIF date and camera extraction, thumbnails, albums, decompression-bomb guard, integrity sweep |
-| **Expenses** | Integer-cent money, categories with monthly budgets, receipt photos, 12-month trend, budget-vs-actual, top merchants, filters and pagination |
+| **Contacts** | Tags (many-to-many), favorites, photo, birthday reminders, duplicate detection (email / phone / name) with **one-click merge**, vCard import and export, a QR code that adds the contact to a phone |
+| **Pictures** | Content-addressed storage (SHA-256 dedup), EXIF date and camera extraction, thumbnails, albums. **iPhone photos work:** both MPO JPEGs and HEIC, with a browser-viewable JPEG copy. Decompression-bomb guard and integrity sweep |
+| **Expenses** | Integer-cent money, categories with monthly budgets, receipt photos, 12-month trend, budget-vs-actual, top merchants, **subscription detection** (window functions), filters and pagination |
 | **Barcodes / QR** | Generate QR, EAN-13/8, UPC-A, Code 128/39, and ISBN-13 (check digits computed and verified), Wi-Fi QR builder, PNG/SVG export, decode from photos or a **live webcam** |
 | **Custom sections** | Define your own "tables" in the UI (13 field types: text, money, date, select, picture/contact/code links, **formulas**, …). Records are validated JSON documents. Sort and filter on any field; numeric columns get totals |
 | **Formulas** | Spreadsheet-style computed fields: `price * quantity`, `IF(status = "Owned", price, 0)`, `DAYS_BETWEEN(TODAY(), warranty_until)`, `first & " " & last`. Around 35 functions, exact Decimal math, dependency-ordered evaluation with cycle detection, and live validation in the field builder. Results are stored, so they can be sorted and queried in SQL |
 | **SQL console** | Read-only, sandboxed, time-boxed SQL with a schema browser, `EXPLAIN QUERY PLAN`, saved queries, example analytics (window functions, CTEs, FTS), and CSV export |
 | **Search** | One full-text index across every entity (FTS5, porter stemming, prefix matching, ranked with bm25 and highlighted snippets) |
-| **Import / export** | CSV import with automatic header mapping (Google / Outlook / bank exports), dry runs, all-or-nothing transactions, a per-line error report; CSV, JSON and vCard export |
-| **Backups** | Online snapshots through SQLite's backup API, integrity-checked and zipped with media; restore migrates old backups forward and backs up the current state first |
-| **Audit log** | Trigger-maintained history of every insert, update and delete |
+| **Import / export** | CSV import with automatic header mapping (Google / Outlook / bank exports, **and custom sections**), dry runs, all-or-nothing transactions, a per-line error report, and duplicate skipping on re-import. CSV, JSON and vCard export, and a section's export re-imports unchanged |
+| **Backups** | Online snapshots through SQLite's backup API, integrity-checked and zipped with media. A **nightly systemd timer** keeps 14 automatic backups and never prunes manual ones. Restore validates the archive, backs up the current state, then migrates the backup forward |
+| **History & undo** | Triggers snapshot every row before and after each change (`json_object`), giving a field-level diff per record. Deleted contacts, expenses, codes and records can be restored exactly, tags included, with dangling references cleared safely |
 
 ## Quick start
 
@@ -49,6 +49,9 @@ datavault search "coffee"
 datavault backup --keep 10        # snapshot + prune
 datavault restore data/backups/datavault-20261001-120000.zip
 datavault stats --verify-media
+datavault history contacts 12      # field-level change history
+datavault history --deleted        # recently deleted rows …
+datavault history --restore 345    # … and undo one
 ```
 
 ## Architecture
@@ -56,13 +59,15 @@ datavault stats --verify-media
 ```
 datavault/
 ├── migrations/          versioned schema: 0001_init.sql, 0002_search_and_audit.py (generates triggers),
-│                        0003_formulas_and_perf.py (table rebuild, rowid-keyed FTS, FK indexes)
+│                        0003_formulas_and_perf.py (table rebuild, rowid-keyed FTS, FK indexes),
+│                        0004_audit_snapshots.py (before/after JSON snapshots in triggers)
 ├── db.py                connection setup (WAL, FKs, busy timeout), transactions + savepoints, migration runner
 ├── validation.py        one Schema per entity; the API, CLI and importers share the same rules
 ├── repo.py              data-access layer: parameterized SQL, allow-listed identifiers
 ├── media.py             image ingestion, EXIF, thumbnails, integrity checks
 ├── codes.py             barcode/QR validation, rendering, decoding (pyzbar)
 ├── formulas.py          safe formula engine (AST whitelist, Decimal math, dependency graph)
+├── history.py           change history (field diffs) and undelete from audit snapshots
 ├── query.py             sandboxed read-only SQL console
 ├── transfer.py          CSV/vCard/JSON import-export, backup/restore
 ├── web.py               Flask REST API (≈60 endpoints) + security headers
@@ -86,7 +91,12 @@ datavault/
 
 - **Transactions:** every write uses `BEGIN IMMEDIATE`, and nested helpers join through `SAVEPOINT`s. CSV imports use one savepoint per row, so invalid rows are collected and reported together. The whole file then commits or rolls back.
 - **Upserts:** `INSERT … ON CONFLICT DO UPDATE … RETURNING` handles tags and scanned codes (it bumps `scan_count`).
-- **Analytics in SQL:** recursive CTEs generate continuous month series (months with no spending still appear), `FULL OUTER JOIN` drives budget-vs-actual, and window functions (`LAG`, `RANK`, running `SUM`) power the examples.
+- **Analytics in SQL:**
+  - recursive CTEs generate continuous month series, so months with no spending still appear
+  - `FULL OUTER JOIN` drives budget-vs-actual
+  - the subscription detector partitions by merchant and uses `LAG()` to count consecutive months, with a variance bound on the amount
+  - window functions (`LAG`, `RANK`, running `SUM`) power the example queries
+- **Merging** duplicate contacts runs in one transaction. It fills blank fields, unions tags, and re-points expenses and contact fields stored inside JSON documents (`json_set` with a bound path). A failure leaves nothing half-merged.
 - **Migrations:** version tracking uses `PRAGMA user_version`, and each migration runs in its own transaction. SQL files are split with `sqlite3.complete_statement`, so trigger bodies survive.
 
 ### Security (it's local, but done properly)
@@ -102,7 +112,7 @@ datavault/
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q     # 116 tests
+.venv/bin/python -m pytest -q     # 134 tests
 ```
 
 The tests cover the following:
@@ -119,6 +129,12 @@ The tests cover the following:
 - backup and restore
 - HTTP CSRF and error contracts
 - the formula engine: values, blanks, cycles, and **injection attempts** such as `__import__`, attribute access and lambdas
+- history and undo: field diffs (including inside JSON documents), restoring with tags, clearing dangling references, and refusing records whose section was deleted
+- merges, including an atomicity test where the second ID is bogus and the first merge must roll back
+- subscription detection that must ignore varied grocery spending
+- section CSV round-trips
+- MPO and HEIC photo uploads
+- backup pruning that is limited to its own label
 - regression tests for every bug found in a code audit:
   - `NaN` and `Infinity` amounts
   - Unicode stored inside JSON documents
@@ -134,8 +150,13 @@ The tests cover the following:
 
 ## Running as a service
 
-`datavault.service` is a systemd **user** unit:
+`deploy/` has systemd **user** units for the app and a nightly backup:
 
 ```bash
-cp datavault.service ~/.config/systemd/user/ && systemctl --user enable --now datavault
+cp deploy/*.service deploy/*.timer ~/.config/systemd/user/
+systemctl --user enable --now datavault datavault-backup.timer
 ```
+
+## CI
+
+GitHub Actions runs lint and the full test suite on Python 3.11, 3.12 and 3.13 on every push (`.github/workflows/ci.yml`).

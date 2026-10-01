@@ -236,6 +236,30 @@ route("/", async (el) => {
     </div>`;
 });
 
+// ================================================================ history
+const FIELD_NAMES = { first_name: "First name", last_name: "Last name", amount_cents: "Amount", spent_on: "Date",
+  category_id: "Category", contact_id: "Contact", receipt_picture_id: "Receipt", photo_id: "Photo", job_title: "Job title",
+  postal_code: "Postal code", payment_method: "Payment method", scan_count: "Times scanned" };
+const fmtVal = (field, v) => {
+  if (v == null || v === "") return `<span class="muted">empty</span>`;
+  if (field === "amount_cents" || field === "monthly_budget_cents") return esc(money(v));
+  if (Array.isArray(v)) return esc(v.join(", ") || "none");
+  if (typeof v === "boolean") return v ? "yes" : "no";
+  return esc(String(v).length > 120 ? String(v).slice(0, 120) + "…" : v);
+};
+
+async function historyModal(table, id, title) {
+  const h = await api(`/api/history/${table}/${id}`);
+  const verb = { INSERT: "Created", UPDATE: "Changed", DELETE: "Deleted" };
+  modal({ title: `History — ${title}`, wide: true, body: h.length ? h.map((e) => `<div class="hist">
+      <div class="hist-head"><span class="pill">${verb[e.action]}</span><span class="muted small">${esc(new Date(e.at).toLocaleString())}</span></div>
+      ${e.action === "UPDATE" ? (e.changes.length ? `<table class="diff"><tbody>${e.changes.map((c) => `<tr><td class="muted">${esc(FIELD_NAMES[c.field] || (c.field[0].toUpperCase() + c.field.slice(1)).replace(/_/g, " "))}</td>
+        <td class="old">${fmtVal(c.field, c.old)}</td><td>→</td><td class="new">${fmtVal(c.field, c.new)}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted small">no visible field changes</div>`) : ""}
+      ${!e.snapshot ? `<div class="muted small">(recorded before change snapshots were added)</div>` : ""}</div>`).join("")
+    : `<div class="empty"><b>No history</b></div>` });
+}
+
 // =============================================================== contacts
 const CONTACT_FIELDS = [
   { name: "first_name", label: "First name", required: true }, { name: "last_name", label: "Last name" },
@@ -265,7 +289,7 @@ async function contactForm(existing, onSaved) {
       ${formHtml(CONTACT_FIELDS, values)}
       <div style="margin-top:14px;display:flex;gap:12px;align-items:center" class="full">
         <div id="photo-prev">${existing?.photo_id ? `<img class="avatar lg" src="/media/${existing.photo_id}/thumb">` : ""}</div>
-        <label class="btn ghost small">📷 ${existing?.photo_id ? "Change" : "Add"} photo<input type="file" accept="image/*" hidden id="photo-in"></label>
+        <label class="btn ghost small">📷 ${existing?.photo_id ? "Change" : "Add"} photo<input type="file" accept="image/*,.heic,.heif" hidden id="photo-in"></label>
         ${existing?.photo_id ? `<button class="ghost small danger" id="photo-rm">Remove photo</button>` : ""}
       </div>`,
     foot: `<button class="ghost" data-close>Cancel</button><button data-save>${existing ? "Save changes" : "Create contact"}</button>`,
@@ -349,9 +373,11 @@ route("/contacts(?:/(\\d+))?", async (el, id, params) => {
         <dt>Updated</dt><dd class="muted">${esc(new Date(c.updated_at).toLocaleString())}</dd>
       </dl>
       <div class="actions" style="margin-top:18px"><button id="edit">Edit</button>
+        <button class="ghost" id="hist">History</button>
         <a class="btn ghost" href="/api/contacts/${c.id}/vcard">Download vCard</a>
         <button class="ghost danger" id="del">Delete</button></div>`;
     $("#edit", el).onclick = () => contactForm(c, async (s) => { await loadList(); loadTags(); showDetail(s.id); });
+    $("#hist", el).onclick = () => historyModal("contacts", c.id, c.full_name).catch(fail);
     $("#del", el).onclick = async () => {
       if (!(await confirmBox(`Delete ${c.full_name}? Linked expenses are kept but unlinked.`))) return;
       await api(`/api/contacts/${c.id}`, { method: "DELETE" }).catch(fail);
@@ -375,9 +401,23 @@ route("/contacts(?:/(\\d+))?", async (el, id, params) => {
   $("#new", el).onclick = () => contactForm(null, async (s) => { await loadList(); loadTags(); showDetail(s.id); });
   $("#dupes", el).onclick = async () => {
     const d = await api("/api/contacts/duplicates");
-    modal({ title: "Possible duplicates", body: d.length ? `<table><thead><tr><th>Match on</th><th>Value</th><th>Contacts</th></tr></thead><tbody>
-      ${d.map((g) => `<tr><td>${esc(g.match_on)}</td><td>${esc(g.value)}</td><td>${JSON.parse(g.ids).map((i) => `<a href="#/contacts/${i}" data-close>#${i}</a>`).join(", ")}</td></tr>`).join("")}
+    const m = modal({ title: "Possible duplicates", wide: true, body: d.length ? `<p class="muted small">Merging keeps the first contact,
+      fills in its blank fields from the others, combines tags, and moves their expenses and section links over. It's recorded in
+      History and the merged contacts can be restored from Recently deleted.</p>
+      <table><thead><tr><th>Match on</th><th>Value</th><th>Contacts</th><th></th></tr></thead><tbody>
+      ${d.map((g) => { const ids = JSON.parse(g.ids).sort((a, b) => a - b); return `<tr><td>${esc(g.match_on)}</td><td>${esc(g.value)}</td>
+        <td>${ids.map((i) => `<a href="#/contacts/${i}" data-close>#${i}</a>`).join(", ")}</td>
+        <td><button class="ghost small" data-merge="${ids.join(",")}">Merge into #${ids[0]}</button></td></tr>`; }).join("")}
       </tbody></table>` : `<div class="empty"><b>No duplicates</b>No two contacts share an email, phone or name.</div>` });
+    m.el.addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-merge]"); if (!b) return;
+      const [keep, ...rest] = b.dataset.merge.split(",").map(Number);
+      if (!(await confirmBox(`Merge #${rest.join(", #")} into #${keep}?`, { ok: "Merge", danger: false }))) return;
+      try {
+        await api(`/api/contacts/${keep}/merge`, { method: "POST", body: { merge_ids: rest } });
+        m.close(); toast("Contacts merged"); await Promise.all([loadList(), loadTags()]); showDetail(keep);
+      } catch (err) { fail(err); }
+    });
   };
   await Promise.all([loadTags(), loadList()]);
   if (state.selected) showDetail(state.selected).catch(fail);
@@ -403,7 +443,7 @@ async function pictureViewer(id, onChange) {
     ...p.used_by.expenses.map((e) => `<a href="#/expenses?edit=${e.id}" data-close>${esc(e.merchant || "expense")} ${esc(e.spent_on)}</a> (receipt)`)];
   const m = modal({
     title: p.title || p.original_name, wide: true,
-    body: `<div class="lightbox"><a href="/media/${p.id}/file" target="_blank"><img src="/media/${p.id}/file" alt=""></a><div>
+    body: `<div class="lightbox"><a href="/media/${p.id}/view" target="_blank"><img src="/media/${p.id}/view" alt=""></a><div>
       ${formHtml(META, p)}
       <dl class="kv small" style="margin-top:14px;grid-template-columns:90px 1fr">
         <dt>File</dt><dd>${esc(p.original_name)}</dd><dt>Size</dt><dd>${p.width}×${p.height} · ${fmtBytes(p.size_bytes)}</dd>
@@ -429,7 +469,7 @@ route("/pictures", async (el, params) => {
   el.innerHTML = `
     <div class="page-head"><div><h1>Pictures</h1><p>Stored once by content hash, with EXIF date & camera extracted.</p></div>
       <div class="actions"><a class="btn ghost" href="/api/export/pictures.csv">Export metadata CSV</a></div></div>
-    <label class="dropzone" id="drop"><input type="file" accept="image/*" multiple hidden id="files">
+    <label class="dropzone" id="drop"><input type="file" accept="image/*,.heic,.heif" multiple hidden id="files">
       <b>Drop images here</b> or click to browse · JPEG, PNG, WebP, GIF, TIFF up to 40 MB each</label>
     <div class="toolbar"><input type="search" id="q" placeholder="Filter by title, description, file name…">
       <select id="album"><option value="">All albums</option></select><span class="muted small" id="count"></span></div>
@@ -477,8 +517,8 @@ async function expenseForm(existing, onSaved, preset = {}) {
     body: `<datalist id="merchant-list"></datalist><datalist id="pm-list"><option value="Visa"><option value="Mastercard"><option value="Debit"><option value="Cash"><option value="Apple Pay"></datalist>
       ${formHtml(FIELDS, values)}
       <div style="margin-top:14px;display:flex;gap:12px;align-items:center"><div id="rc"></div>
-        <label class="btn ghost small">🧾 Attach receipt<input type="file" accept="image/*" hidden id="rc-in"></label></div>`,
-    foot: `${existing ? `<button class="ghost danger" data-del>Delete</button><span class="spacer"></span>` : ""}
+        <label class="btn ghost small">🧾 Attach receipt<input type="file" accept="image/*,.heic,.heif" hidden id="rc-in"></label></div>`,
+    foot: `${existing ? `<button class="ghost danger" data-del>Delete</button><button class="ghost" data-hist>History</button><span class="spacer"></span>` : ""}
       <button class="ghost" data-close>Cancel</button><button data-save>${existing ? "Save" : "Add expense"}</button>`,
   });
   const showReceipt = () => { m.$("#rc").innerHTML = receipt ? `<a href="/media/${receipt}/file" target="_blank"><img src="/media/${receipt}/thumb" style="height:56px;border-radius:6px"></a>
@@ -502,8 +542,9 @@ async function expenseForm(existing, onSaved, preset = {}) {
   m.$("[data-del]")?.addEventListener("click", async () => {
     if (!(await confirmBox("Delete this expense?"))) return;
     await api(`/api/expenses/${existing.id}`, { method: "DELETE" }).catch(fail);
-    m.close(); toast("Expense deleted"); onSaved(null);
+    m.close(); toast("Expense deleted — undo from Data › Recently deleted"); onSaved(null);
   });
+  m.$("[data-hist]")?.addEventListener("click", () => historyModal("expenses", existing.id, existing.merchant || "expense").catch(fail));
 }
 
 function categoryManager(onChange) {
@@ -558,6 +599,11 @@ route("/expenses", async (el, params) => {
       <div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><h3>12-month trend</h3><span class="muted small">click a bar to filter</span></div><div id="trend"></div></div>
       <div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><h3 style="margin:0">Budget</h3>
         <input type="month" id="month" value="${state.month}" style="padding:4px 8px"></div><div id="budget"></div></div></div>
+    <div class="card" id="recurring-card" style="margin-bottom:16px" hidden><div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">Recurring charges</h3><span class="muted small" id="rec-total"></span></div>
+      <p class="muted small" style="margin:6px 0 10px">Same merchant, about the same amount, month after month — detected with a SQL window function (<code>LAG</code>).</p>
+      <div class="table-wrap"><table><thead><tr><th>Merchant</th><th class="right">Typical</th><th class="right">Months</th><th>Last charge</th><th>Next expected</th><th class="right">Per year</th></tr></thead>
+      <tbody id="rec-rows"></tbody></table></div></div>
     <div class="toolbar"><input type="search" id="q" placeholder="Merchant, description, method…">
       <select id="cat"><option value="">All categories</option>${cats.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}<option value="none">Uncategorized</option></select>
       <input type="date" id="df" title="From"><input type="date" id="dt" title="To">
@@ -599,7 +645,19 @@ route("/expenses", async (el, params) => {
       th.textContent = th.textContent.replace(/ [▲▼]$/, "") + arrow;
     });
   };
-  const refresh = () => Promise.all([loadRows(), loadSummary()]).catch(fail);
+  const loadRecurring = async () => {
+    const r = await api("/api/expenses/recurring");
+    $("#recurring-card", el).hidden = !r.items.length;
+    $("#rec-total", el).textContent = `${money(r.monthly_cents)}/month · ${money(r.yearly_cents)}/year`;
+    $("#rec-rows", el).innerHTML = r.items.map((x) => `<tr class="clickable" data-merchant="${esc(x.merchant)}"><td><b>${esc(x.merchant)}</b></td>
+      <td class="num">${money(x.avg_cents)}</td><td class="num">${x.months_charged}</td><td>${esc(fmtDate(x.last_charge))}</td>
+      <td>${esc(fmtDate(x.next_expected))}</td><td class="num">${money(x.yearly_cents)}</td></tr>`).join("");
+  };
+  $("#rec-rows", el).addEventListener("click", (e) => {
+    const tr = e.target.closest("[data-merchant]"); if (!tr) return;
+    $("#q", el).value = state.q = tr.dataset.merchant; state.offset = 0; loadRows().catch(fail);
+  });
+  const refresh = () => Promise.all([loadRows(), loadSummary(), loadRecurring()]).catch(fail);
   const bind = (sel, key) => $(sel, el).addEventListener("input", debounce((e) => { state[key] = e.target.value; state.offset = 0; loadRows().catch(fail); }, 300));
   bind("#q", "q"); bind("#cat", "category_id"); bind("#df", "date_from"); bind("#dt", "date_to"); bind("#mn", "min_amount"); bind("#mx", "max_amount");
   $("#month", el).addEventListener("change", (e) => { state.month = e.target.value; loadSummary().catch(fail); });
@@ -648,7 +706,7 @@ route("/codes", async (el) => {
         <div class="preview-box" style="margin-top:12px" id="preview"><span class="muted">Live preview</span></div>
         <div class="actions" style="margin-top:12px"><button id="save">Save to library</button><span class="field-error" id="gen-err"></span></div></div>
       <div class="card"><h2>Scan</h2>
-        <label class="dropzone" id="scan-drop"><input type="file" accept="image/*" hidden id="scan-file"><b>Drop a photo of a barcode / QR</b> or click — every code in the image is read</label>
+        <label class="dropzone" id="scan-drop"><input type="file" accept="image/*,.heic,.heif" hidden id="scan-file"><b>Drop a photo of a barcode / QR</b> or click — every code in the image is read</label>
         <div class="actions" style="margin-bottom:10px"><button class="ghost" id="cam">📷 Use webcam</button>
           <label class="check"><input type="checkbox" id="autosave" checked> Save scans to library</label></div>
         <video class="scanner" id="video" playsinline muted hidden></video>
@@ -943,8 +1001,9 @@ async function recordForm(sec, existing, onSaved) {
       <span class="muted mono" style="font-size:11px"> = ${esc(f.options.expr)}</span></dd>`).join("")}</dl></div>` : "";
   const m = modal({
     title: existing ? `Edit ${sec.name} record` : `New ${sec.name} record`, wide: F.length > 5, body: formHtml(F, values) + fxBlock,
-    foot: `${existing ? `<button class="ghost danger" data-del>Delete</button><span class="spacer"></span>` : ""}<button class="ghost" data-close>Cancel</button><button data-save>Save</button>`,
+    foot: `${existing ? `<button class="ghost danger" data-del>Delete</button><button class="ghost" data-hist>History</button><span class="spacer"></span>` : ""}<button class="ghost" data-close>Cancel</button><button data-save>Save</button>`,
   });
+  m.$("[data-hist]")?.addEventListener("click", () => historyModal("section_records", existing.id, sec.name).catch(fail));
   m.$("[data-save]").onclick = async () => {
     try {
       const body = readForm(m.el, F);
@@ -986,7 +1045,8 @@ route("/s/([a-z0-9-]+)", async (el, slug) => {
   el.innerHTML = `
     <div class="page-head"><div><h1>${esc(sec.icon)} ${esc(sec.name)}</h1><p>${esc(sec.description || "Custom section")}</p></div>
       <div class="actions">${hasFx ? `<button class="ghost" id="recalc" title="Recompute every formula">ƒ Recalculate</button>` : ""}
-        <button class="ghost" id="edit">Edit fields</button><a class="btn ghost" href="/api/export/section:${esc(sec.slug)}.csv">Export CSV</a>
+        <button class="ghost" id="edit">Edit fields</button><a class="btn ghost" href="#/data?import=section:${esc(sec.slug)}">Import CSV</a>
+        <a class="btn ghost" href="/api/export/section:${esc(sec.slug)}.csv">Export CSV</a>
         <button id="new">＋ New record</button></div></div>
     <div class="toolbar"><input type="search" id="q" placeholder="Search records…">
       ${filterable.map((f) => `<select data-filter="${esc(f.key)}"><option value="">${esc(f.label)}: any</option>
@@ -1123,7 +1183,8 @@ route("/data", async (el, params) => {
       <div class="card"><h2>Import</h2>
         <div class="form-grid"><label class="field"><span>Into</span><select id="ent">
           <option value="contacts">Contacts (CSV)</option><option value="vcard">Contacts (vCard .vcf)</option>
-          <option value="expenses">Expenses (CSV)</option><option value="codes">Barcodes / QR (CSV)</option></select></label>
+          <option value="expenses">Expenses (CSV)</option><option value="codes">Barcodes / QR (CSV)</option>
+          ${sections.map((s) => `<option value="section:${esc(s.slug)}">${esc(s.icon)} ${esc(s.name)} (CSV)</option>`).join("")}</select></label>
           <label class="field"><span>File</span><input type="file" id="file" accept=".csv,.tsv,.txt,.vcf"></label></div>
         <div id="mapping" style="margin-top:12px"></div>
         <div class="actions" style="margin-top:12px"><button class="ghost" id="dry" disabled>Dry run</button><button id="go" disabled>Import</button>
@@ -1145,7 +1206,11 @@ route("/data", async (el, params) => {
         <div class="list-row"><span style="flex:1">Integrity check<div class="muted small">PRAGMA integrity_check + foreign_key_check</div></span><button class="ghost small" data-mt="integrity">Run</button></div>
         <div class="list-row"><span style="flex:1">Optimize<div class="muted small">FTS merge, PRAGMA optimize, VACUUM</div></span><button class="ghost small" data-mt="optimize">Run</button></div>
         <div class="list-row"><span style="flex:1">Verify media<div class="muted small">re-hash files, find missing/orphaned, rebuild thumbnails</div></span><button class="ghost small" data-mt="verify-media">Run</button></div>
-        <pre id="mt-out" class="editor" style="min-height:0;margin-top:12px" hidden></pre></div></div>`;
+        <div class="list-row"><span style="flex:1">Prune history<div class="muted small">drop change-history entries older than a year</div></span><button class="ghost small" data-mt="prune-audit">Run</button></div>
+        <pre id="mt-out" class="editor" style="min-height:0;margin-top:12px" hidden></pre></div></div>
+    <div class="card" style="margin-top:16px"><div style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0">Recently deleted</h2>
+      <span class="muted small">contacts, expenses, codes and section records can be restored exactly as they were</span></div>
+      <div id="deleted" style="margin-top:10px"></div></div>`;
 
   // --- import wizard
   let headerInfo = null;
@@ -1199,7 +1264,22 @@ route("/data", async (el, params) => {
     try { out.textContent = JSON.stringify(await api(`/api/maintenance/${b.dataset.mt}`, { method: "POST" }), null, 2); }
     catch (err) { out.textContent = err.message; } finally { b.disabled = false; }
   });
-  await loadBackups();
+  const loadDeleted = async () => {
+    const d = await api("/api/deleted");
+    const names = { contacts: "Contact", expenses: "Expense", codes: "Code", section_records: "Record" };
+    $("#deleted", el).innerHTML = d.map((x) => `<div class="list-row"><span class="pill">${names[x.table]}</span>
+      <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.label)}</span>
+      <span class="muted small nowrap">${ago(x.at)}</span><button class="ghost small" data-restore="${x.audit_id}">Restore</button></div>`).join("")
+      || `<div class="empty">Nothing deleted recently</div>`;
+  };
+  $("#deleted", el).addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-restore]"); if (!b) return;
+    try {
+      const r = await api(`/api/deleted/${b.dataset.restore}/restore`, { method: "POST" });
+      toast(`Restored${r.notes.length ? ` (${r.notes.join("; ")})` : ""}`); loadDeleted();
+    } catch (err) { fail(err); }
+  });
+  await Promise.all([loadBackups(), loadDeleted()]);
 });
 
 // ========================================================= global search

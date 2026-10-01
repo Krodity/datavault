@@ -3,7 +3,7 @@ name = "datavault"
 version = "1.0.0"
 description = "Personal SQLite data vault: contacts, pictures, expenses, barcodes/QR codes and user-defined sections, with a REST API, CLI and web UI."
 requires-python = ">=3.11"
-dependencies = ["flask>=3.1", "pillow>=11", "qrcode>=8", "python-barcode>=0.15", "pyzbar>=0.1.9"]
+dependencies = ["flask>=3.1", "pillow>=11", "qrcode>=8", "python-barcode>=0.15", "pyzbar>=0.1.9", "pillow-heif>=0.18"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
