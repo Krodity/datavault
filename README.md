@@ -157,6 +157,10 @@ cp deploy/*.service deploy/*.timer ~/.config/systemd/user/
 systemctl --user enable --now datavault datavault-backup.timer
 ```
 
+To reach it from other devices through a reverse proxy (for example `tailscale serve --https=8800 http://127.0.0.1:8800`),
+list the proxy's hostname in `DATAVAULT_ALLOWED_HOSTS` (comma-separated) or pass `--allow-host`. The app keeps listening on
+loopback only, and the Host-header check keeps rejecting every other name.
+
 ## CI
 
 GitHub Actions runs lint and the full test suite on Python 3.11, 3.12 and 3.13 on every push (`.github/workflows/ci.yml`).

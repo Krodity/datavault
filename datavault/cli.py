@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 import sys
 from datetime import date, timedelta
@@ -46,8 +47,11 @@ def cmd_init(cfg, a):
 
 def cmd_serve(cfg, a):
     from .web import create_app
-    app = create_app(cfg, allowed_hosts=set(a.allow_host or []))
-    print(f"DataVault on http://{a.host}:{a.port}  (data: {cfg.home})")
+    # extra Host names (e.g. a tailnet/reverse-proxy name) from flags or DATAVAULT_ALLOWED_HOSTS
+    env_hosts = {h.strip() for h in os.environ.get("DATAVAULT_ALLOWED_HOSTS", "").split(",") if h.strip()}
+    hosts = set(a.allow_host or []) | env_hosts
+    app = create_app(cfg, allowed_hosts=hosts)
+    print(f"DataVault on http://{a.host}:{a.port}  (data: {cfg.home})" + (f"  also answering as: {', '.join(sorted(hosts))}" if hosts else ""))
     if a.debug:
         app.run(host=a.host, port=a.port, debug=True)
         return
