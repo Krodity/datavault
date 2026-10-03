@@ -200,17 +200,18 @@ route("/", async (el) => {
   const delta = t.prev_month_cents ? ((t.month_cents - t.prev_month_cents) / t.prev_month_cents) * 100 : null;
   const verb = { INSERT: "Added", UPDATE: "Updated", DELETE: "Deleted" };
   const linkFor = (a) => ({ contacts: `#/contacts/${a.row_id}`, expenses: `#/expenses?edit=${a.row_id}`, pictures: `#/pictures?open=${a.row_id}`,
-    codes: "#/codes", section_records: null }[a.table_name]);
+    codes: "#/codes", section_records: null, notes: `#/notes/${a.row_id}`, folders: `#/folders/${a.row_id}`, files: null }[a.table_name]);
   el.innerHTML = `
     <div class="page-head"><div><h1>Dashboard</h1><p>Everything in your vault at a glance.</p></div>
       <div class="actions"><a class="btn ghost" href="#/sql">Open SQL console</a><a class="btn" href="#/expenses?new=1">＋ Expense</a></div></div>
-    <div class="grid cols-4" style="margin-bottom:16px">
+    <div class="grid cols-5" style="margin-bottom:16px">
       <a class="card stat" href="#/expenses"><span class="label">Spent in ${esc(monthLabel(sum.month))}</span>
         <span class="value">${money(t.month_cents)}</span>
         <span class="delta ${delta > 0 ? "up" : "down"}">${delta == null ? "&nbsp;" : `${delta > 0 ? "▲" : "▼"} ${Math.abs(delta).toFixed(0)}% vs last month`}</span></a>
       <a class="card stat" href="#/contacts"><span class="label">Contacts</span><span class="value">${c.contacts}</span><span class="muted small">${c.tags} tags</span></a>
       <a class="card stat" href="#/pictures"><span class="label">Pictures</span><span class="value">${c.pictures}</span><span class="muted small">${fmtBytes(c.media_bytes)}</span></a>
       <a class="card stat" href="#/codes"><span class="label">Codes · Records</span><span class="value">${c.codes} · ${c.records}</span><span class="muted small">${c.sections} custom sections</span></a>
+      <a class="card stat" href="#/folders"><span class="label">Folders</span><span class="value">${c.folders}</span><span class="muted small">${c.notes} notes · ${c.files} files</span></a>
     </div>
     <div class="grid span" style="margin-bottom:16px">
       <div class="card"><h3>Monthly spending</h3>${barChart(sum.trend, { value: (d) => d.total_cents, label: (d) => monthLabel(d.month), fmt: shortMoney })}</div>
@@ -373,11 +374,12 @@ route("/contacts(?:/(\\d+))?", async (el, id, params) => {
         <dt>Updated</dt><dd class="muted">${esc(new Date(c.updated_at).toLocaleString())}</dd>
       </dl>
       <div class="actions" style="margin-top:18px"><button id="edit">Edit</button>
-        <button class="ghost" id="hist">History</button>
+        <button class="ghost" id="hist">History</button><button class="ghost" id="cfold">Folders…</button>
         <a class="btn ghost" href="/api/contacts/${c.id}/vcard">Download vCard</a>
         <button class="ghost danger" id="del">Delete</button></div>`;
     $("#edit", el).onclick = () => contactForm(c, async (s) => { await loadList(); loadTags(); showDetail(s.id); });
     $("#hist", el).onclick = () => historyModal("contacts", c.id, c.full_name).catch(fail);
+    $("#cfold", el).onclick = () => editItemFolders("contact", c.id).catch(fail);
     $("#del", el).onclick = async () => {
       if (!(await confirmBox(`Delete ${c.full_name}? Linked expenses are kept but unlinked.`))) return;
       await api(`/api/contacts/${c.id}`, { method: "DELETE" }).catch(fail);
@@ -451,8 +453,10 @@ async function pictureViewer(id, onChange) {
         <dt>SHA-256</dt><dd class="mono" style="font-size:10.5px">${esc(p.sha256)}</dd>
         ${used.length ? `<dt>Used by</dt><dd>${used.join("<br>")}</dd>` : ""}</dl></div></div>`,
     foot: `<button class="ghost danger" data-del>Delete</button><a class="btn ghost" href="/media/${p.id}/file?download=1">Download original</a>
+      <button class="ghost" data-folders>Folders…</button>
       <span class="spacer"></span><button class="ghost" data-close>Close</button><button data-save>Save</button>`,
   });
+  m.$("[data-folders]").onclick = () => editItemFolders("picture", id).catch(fail);
   m.$("[data-save]").onclick = async () => {
     try { await api(`/api/pictures/${id}`, { method: "PATCH", body: readForm(m.el, META) }); m.close(); toast("Saved"); onChange?.(); }
     catch (e) { showErrors(m.el, e); }
@@ -518,7 +522,7 @@ async function expenseForm(existing, onSaved, preset = {}) {
       ${formHtml(FIELDS, values)}
       <div style="margin-top:14px;display:flex;gap:12px;align-items:center"><div id="rc"></div>
         <label class="btn ghost small">🧾 Attach receipt<input type="file" accept="image/*,.heic,.heif" hidden id="rc-in"></label></div>`,
-    foot: `${existing ? `<button class="ghost danger" data-del>Delete</button><button class="ghost" data-hist>History</button><span class="spacer"></span>` : ""}
+    foot: `${existing ? `<button class="ghost danger" data-del>Delete</button><button class="ghost" data-hist>History</button><button class="ghost" data-folders>Folders…</button><span class="spacer"></span>` : ""}
       <button class="ghost" data-close>Cancel</button><button data-save>${existing ? "Save" : "Add expense"}</button>`,
   });
   const showReceipt = () => { m.$("#rc").innerHTML = receipt ? `<a href="/media/${receipt}/file" target="_blank"><img src="/media/${receipt}/thumb" style="height:56px;border-radius:6px"></a>
@@ -545,6 +549,7 @@ async function expenseForm(existing, onSaved, preset = {}) {
     m.close(); toast("Expense deleted — undo from Data › Recently deleted"); onSaved(null);
   });
   m.$("[data-hist]")?.addEventListener("click", () => historyModal("expenses", existing.id, existing.merchant || "expense").catch(fail));
+  m.$("[data-folders]")?.addEventListener("click", () => editItemFolders("expense", existing.id).catch(fail));
 }
 
 function categoryManager(onChange) {
@@ -758,7 +763,8 @@ route("/codes", async (el) => {
         <div class="payload">${esc(c.payload)}</div>
         <div class="muted small">${info}${c.scan_count ? ` · scanned ${c.scan_count}×` : ""} · ${esc(c.source)}</div>
         <div class="actions"><a class="btn ghost small" href="/api/codes/${c.id}/image.png?download=1">PNG</a><a class="btn ghost small" href="/api/codes/${c.id}/image.svg?download=1">SVG</a>
-          <button class="ghost small" data-act="copy">Copy</button><button class="ghost small" data-act="edit">Edit</button><button class="icon-btn" data-act="del" title="Delete">🗑</button></div></div>`;
+          <button class="ghost small" data-act="copy">Copy</button><button class="ghost small" data-act="edit">Edit</button>
+          <button class="ghost small" data-act="folders" title="Folders">📁</button><button class="icon-btn" data-act="del" title="Delete">🗑</button></div></div>`;
     }).join("") || `<div class="card empty" style="grid-column:1/-1"><b>Library is empty</b>Generate or scan a code above.</div>`;
   };
   $("#save", el).onclick = async () => {
@@ -773,6 +779,7 @@ route("/codes", async (el) => {
   $("#lib", el).addEventListener("click", async (e) => {
     const b = e.target.closest("[data-act]"); if (!b) return;
     const id = b.closest("[data-id]").dataset.id;
+    if (b.dataset.act === "folders") return editItemFolders("code", +id).catch(fail);
     if (b.dataset.act === "copy") { const c = await api(`/api/codes/${id}`); await navigator.clipboard.writeText(c.payload); toast("Payload copied"); }
     if (b.dataset.act === "del" && await confirmBox("Delete this code?")) { await api(`/api/codes/${id}`, { method: "DELETE" }); loadLib(); }
     if (b.dataset.act === "edit") {
@@ -1001,9 +1008,10 @@ async function recordForm(sec, existing, onSaved) {
       <span class="muted mono" style="font-size:11px"> = ${esc(f.options.expr)}</span></dd>`).join("")}</dl></div>` : "";
   const m = modal({
     title: existing ? `Edit ${sec.name} record` : `New ${sec.name} record`, wide: F.length > 5, body: formHtml(F, values) + fxBlock,
-    foot: `${existing ? `<button class="ghost danger" data-del>Delete</button><button class="ghost" data-hist>History</button><span class="spacer"></span>` : ""}<button class="ghost" data-close>Cancel</button><button data-save>Save</button>`,
+    foot: `${existing ? `<button class="ghost danger" data-del>Delete</button><button class="ghost" data-hist>History</button><button class="ghost" data-folders>Folders…</button><span class="spacer"></span>` : ""}<button class="ghost" data-close>Cancel</button><button data-save>Save</button>`,
   });
   m.$("[data-hist]")?.addEventListener("click", () => historyModal("section_records", existing.id, sec.name).catch(fail));
+  m.$("[data-folders]")?.addEventListener("click", () => editItemFolders("record", existing.id).catch(fail));
   m.$("[data-save]").onclick = async () => {
     try {
       const body = readForm(m.el, F);
@@ -1037,7 +1045,7 @@ function renderCell(f, v) {
   }
 }
 
-route("/s/([a-z0-9-]+)", async (el, slug) => {
+route("/s/([a-z0-9-]+)", async (el, slug, params) => {
   const state = { q: "", sort: "", desc: false, filters: {} };
   let sec = await api(`/api/sections/${slug}`);
   const filterable = sec.fields.filter((f) => ["select", "boolean"].includes(f.type));
@@ -1086,11 +1094,499 @@ route("/s/([a-z0-9-]+)", async (el, slug) => {
   });
   $("#new", el).onclick = () => recordForm(sec, null, () => { load(); loadSectionNav(); }).catch(fail);
   $("#edit", el).onclick = async () => { sec = await api(`/api/sections/${sec.id}`); sectionBuilder(sec).catch(fail); };
+  if (params.open) api(`/api/records/${params.open}`).then((rec) => recordForm(sec, rec, () => { load(); loadSectionNav(); })).catch(fail);
   $("#recalc", el)?.addEventListener("click", async () => {
     const r = await api(`/api/sections/${sec.id}/recalculate`, { method: "POST" }).catch(fail);
     if (r) { toast(`Recalculated · ${r.changed} record${r.changed === 1 ? "" : "s"} changed`); load(); }
   });
   await load();
+});
+
+// ================================================================ folders
+const ITEM_KINDS = {
+  note: { label: "Notes", one: "Note", icon: "✎" }, file: { label: "Files", one: "File", icon: "📄" },
+  contact: { label: "Contacts", one: "Contact", icon: "☺" }, picture: { label: "Pictures", one: "Picture", icon: "▣" },
+  expense: { label: "Expenses", one: "Expense", icon: "$" }, code: { label: "Codes", one: "Code", icon: "▦" },
+  record: { label: "Records", one: "Record", icon: "📁" },
+};
+const PROP_TYPES = { text: "Text", longtext: "Long text", number: "Number", money: "Money", date: "Date", boolean: "Yes / No",
+  url: "Link", email: "Email", phone: "Phone" };
+const FILE_ICONS = [[/pdf/, "📕"], [/spreadsheet|excel|csv/, "📊"], [/word|document|rtf/, "📝"], [/presentation|powerpoint/, "📽"],
+  [/zip|tar|compressed|7z|rar/, "🗜"], [/^audio/, "🎵"], [/^video/, "🎬"], [/^image/, "🖼"], [/^text/, "📃"]];
+const fileIcon = (mime) => (FILE_ICONS.find(([re]) => re.test(mime || "")) || [0, "📄"])[1];
+
+let FOLDERS = [];
+async function loadFolders() {
+  FOLDERS = await api("/api/folders");
+  $("#folder-nav").innerHTML = FOLDERS.filter((f) => f.parent_id == null).map((f) => `<a href="#/folders/${f.id}" data-folder-nav="${f.id}">
+    <i style="color:${esc(f.color)}">${esc(f.icon)}</i>${esc(f.name)}<span class="muted small" style="margin-left:auto">${f.total_items || ""}</span></a>`).join("")
+    || `<div class="muted small" style="padding:4px 10px">No folders yet</div>`;
+  markFolderNav();
+  return FOLDERS;
+}
+function markFolderNav() {
+  const m = location.hash.match(/^#\/folders\/(\d+)/);
+  const top = m ? folderPath(+m[1])[0]?.id : null;
+  $$("#folder-nav a").forEach((a) => a.classList.toggle("active", +a.dataset.folderNav === top));
+}
+// ancestors (root first) from the cached flat list
+function folderPath(id) {
+  const byId = Object.fromEntries(FOLDERS.map((f) => [f.id, f]));
+  const out = [];
+  for (let f = byId[id], guard = 0; f && guard < 50; f = byId[f.parent_id], guard++) out.unshift(f);
+  return out;
+}
+// depth-first list for tree pickers: [{folder, depth}]
+function folderTree(excludeId = null) {
+  const kids = {};
+  FOLDERS.forEach((f) => (kids[f.parent_id ?? "root"] ||= []).push(f));
+  const out = [];
+  const walk = (pid, depth) => (kids[pid] || []).forEach((f) => {
+    if (f.id === excludeId) return; // skip a folder and its whole subtree (can't move into itself)
+    out.push({ folder: f, depth }); walk(f.id, depth + 1);
+  });
+  walk("root", 0);
+  return out;
+}
+
+// ---- reusable: choose folders (checkbox tree)
+function folderPicker({ title = "Folders", selected = [], single = false, exclude = null, allowRoot = false } = {}) {
+  return new Promise(async (resolve) => {
+    await loadFolders();
+    const sel = new Set(selected.map(Number));
+    const tree = folderTree(exclude);
+    const m = modal({
+      title, body: tree.length || allowRoot ? `<div class="folder-pick">
+        ${allowRoot ? `<label class="check"><input type="radio" name="fp" value="" ${sel.size ? "" : "checked"}> <i>🏠</i> Top level</label>` : ""}
+        ${tree.map(({ folder: f, depth }) => `<label class="check" style="padding-left:${depth * 20 + 4}px">
+          <input type="${single ? "radio" : "checkbox"}" name="fp" value="${f.id}" ${sel.has(f.id) ? "checked" : ""}>
+          <i style="color:${esc(f.color)}">${esc(f.icon)}</i> ${esc(f.name)}</label>`).join("")}</div>`
+        : `<div class="empty"><b>No folders yet</b>Create one first.</div>`,
+      foot: `<button class="ghost" id="fp-new">＋ New folder</button><span class="spacer"></span><button class="ghost" data-close>Cancel</button><button data-ok>Done</button>`,
+    });
+    let done = false;
+    m.$("[data-ok]").onclick = () => {
+      done = true;
+      const ids = m.$$("input[name=fp]:checked").map((i) => i.value).filter(Boolean).map(Number);
+      m.close(); resolve(single ? (ids[0] ?? null) : ids);
+    };
+    m.$("#fp-new").onclick = () => { m.close(); folderForm(null, null, () => folderPicker({ title, selected, single, exclude, allowRoot }).then(resolve)); done = true; };
+    m.el.addEventListener("click", (e) => { if (e.target.closest("[data-close]") && !done) resolve(undefined); });
+  });
+}
+
+// "Folders…" button on any item's own page
+async function editItemFolders(type, id) {
+  const current = await api(`/api/items/${type}/${id}/folders`);
+  const ids = await folderPicker({ title: `Put this ${ITEM_KINDS[type].one.toLowerCase()} in folders`, selected: current.map((f) => f.id) });
+  if (ids === undefined) return null;
+  const r = await api(`/api/items/${type}/${id}/folders`, { method: "PUT", body: { folder_ids: ids } });
+  toast(r.length ? `In ${r.map((f) => f.name).join(", ")}` : "Not in any folder");
+  loadFolders();
+  return r;
+}
+
+// ---- folder create/edit (name, look, parent, field template)
+function templateRows(rows) {
+  return rows.map((t, i) => `<div class="tpl-row" data-i="${i}">
+    <input data-k="name" value="${esc(t.name)}" placeholder="Field name, e.g. VIN">
+    <select data-k="type">${Object.entries(PROP_TYPES).map(([k, l]) => `<option value="${k}" ${t.type === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+    <button class="icon-btn" data-up title="Move up">↑</button><button class="icon-btn" data-rm title="Remove">✕</button></div>`).join("");
+}
+
+async function folderForm(existing, parentId, onSaved) {
+  await loadFolders();
+  const tpl = (existing?.template || []).map((t) => ({ ...t }));
+  let parent = existing ? existing.parent_id : parentId;
+  const parentLabel = () => parent ? folderPath(parent).map((f) => `${f.icon} ${f.name}`).join(" › ") : "🏠 Top level";
+  const m = modal({
+    title: existing ? `Edit “${existing.name}”` : "New folder", wide: true,
+    body: `<div class="form-grid" style="grid-template-columns:80px 1fr 90px">
+        <label class="field"><span>Icon</span><input id="f-icon" value="${esc(existing?.icon || "📁")}" maxlength="4" style="text-align:center;font-size:18px"></label>
+        <label class="field"><span class="req">Name</span><input id="f-name" value="${esc(existing?.name || "")}" placeholder="e.g. Car, Taxes 2026, Recipes, Pets"></label>
+        <label class="field"><span>Color</span><input id="f-color" type="color" value="${esc(existing?.color || "#6366f1")}"></label>
+        <label class="field" style="grid-column:1/-1"><span>Description</span><input id="f-desc" value="${esc(existing?.description || "")}"></label></div>
+      <div class="list-row" style="margin-top:8px"><span class="muted small" style="flex:1">Inside: <b id="f-parent">${esc(parentLabel())}</b></span>
+        <button class="ghost small" id="f-move">Change…</button></div>
+      <h3 style="margin-top:16px">Field template</h3>
+      <p class="muted small" style="margin-top:0">New notes created in this folder start with these fields. Each note can still add,
+        rename or remove its own. For example, a <i>Vehicles</i> folder could use Make, Model, VIN and Insurance due.</p>
+      <div id="tpl"></div><button class="ghost small" id="tpl-add" style="margin-top:8px">＋ Add field</button>`,
+    foot: `${existing ? `<button class="ghost danger" data-del>Delete folder</button><button class="ghost" data-hist>History</button><span class="spacer"></span>` : ""}
+      <button class="ghost" data-close>Cancel</button><button data-save>${existing ? "Save" : "Create folder"}</button>`,
+  });
+  const render = () => { m.$("#tpl").innerHTML = templateRows(tpl) || `<div class="muted small">No template fields.</div>`; };
+  render();
+  m.$("#tpl").addEventListener("input", (e) => { const r = e.target.closest("[data-i]"); if (r && e.target.dataset.k) tpl[r.dataset.i][e.target.dataset.k] = e.target.value; });
+  m.$("#tpl").addEventListener("click", (e) => {
+    const r = e.target.closest("[data-i]"); if (!r) return; const i = +r.dataset.i;
+    if (e.target.closest("[data-rm]")) { tpl.splice(i, 1); render(); }
+    if (e.target.closest("[data-up]") && i > 0) { [tpl[i - 1], tpl[i]] = [tpl[i], tpl[i - 1]]; render(); }
+  });
+  m.$("#tpl-add").onclick = () => { tpl.push({ name: "", type: "text" }); render(); $$("#tpl [data-k=name]", m.el).at(-1).focus(); };
+  m.$("#f-move").onclick = async () => {
+    const r = await folderPicker({ title: "Put this folder inside…", selected: parent ? [parent] : [], single: true, exclude: existing?.id, allowRoot: true });
+    if (r !== undefined) { parent = r; m.$("#f-parent").textContent = parentLabel(); }
+  };
+  m.$("[data-save]").onclick = async () => {
+    const b = { name: m.$("#f-name").value, icon: m.$("#f-icon").value, color: m.$("#f-color").value, description: m.$("#f-desc").value,
+      parent_id: parent, template: tpl.filter((t) => t.name.trim()) };
+    try {
+      const f = existing ? await api(`/api/folders/${existing.id}`, { method: "PATCH", body: b }) : await api("/api/folders", { method: "POST", body: b });
+      m.close(); toast(existing ? "Folder saved" : "Folder created"); await loadFolders(); onSaved?.(f);
+    } catch (e) { fail(e); }
+  };
+  m.$("[data-hist]")?.addEventListener("click", () => historyModal("folders", existing.id, existing.name).catch(fail));
+  m.$("[data-del]")?.addEventListener("click", async () => {
+    const subs = FOLDERS.filter((f) => folderPath(f.id).some((a) => a.id === existing.id)).length - 1;
+    if (!(await confirmBox(`Delete “${existing.name}”${subs ? ` and its ${subs} subfolder${subs === 1 ? "" : "s"}` : ""}? The items inside are NOT deleted — they're only removed from the folder.`))) return;
+    await api(`/api/folders/${existing.id}`, { method: "DELETE" }).catch(fail);
+    m.close(); toast("Folder deleted"); await loadFolders();
+    location.hash = existing.parent_id ? `#/folders/${existing.parent_id}` : "#/folders";
+  });
+}
+
+// ---- notes: title, body, and freely editable typed fields
+function propInput(p, i) {
+  const v = p.value;
+  switch (p.type) {
+    case "longtext": return `<textarea data-v="${i}" rows="2">${esc(v ?? "")}</textarea>`;
+    case "number": return `<input data-v="${i}" type="number" step="any" value="${esc(v ?? "")}">`;
+    case "money": return `<input data-v="${i}" value="${esc(v ?? "")}" placeholder="0.00">`;
+    case "date": return `<input data-v="${i}" type="date" value="${esc(v ?? "")}">`;
+    case "boolean": return `<label class="check"><input data-v="${i}" type="checkbox" ${v ? "checked" : ""}> yes</label>`;
+    case "url": return `<input data-v="${i}" value="${esc(v ?? "")}" placeholder="https://">`;
+    case "email": return `<input data-v="${i}" type="email" value="${esc(v ?? "")}">`;
+    case "phone": return `<input data-v="${i}" type="tel" value="${esc(v ?? "")}">`;
+    default: return `<input data-v="${i}" value="${esc(v ?? "")}">`;
+  }
+}
+function propDisplay(p) {
+  const v = p.value;
+  if (v == null || v === "") return `<span class="muted">—</span>`;
+  if (p.type === "money") return money(v);
+  if (p.type === "boolean") return v ? "✓ yes" : "✗ no";
+  if (p.type === "date") return esc(fmtDate(v));
+  if (p.type === "url") return `<a href="${esc(v)}" target="_blank" rel="noopener">${esc(v)}</a>`;
+  if (p.type === "email") return `<a href="mailto:${esc(v)}">${esc(v)}</a>`;
+  if (p.type === "phone") return `<a href="tel:${esc(v)}">${esc(v)}</a>`;
+  return esc(v);
+}
+
+async function noteEditor(noteId, { folderId = null, onSaved } = {}) {
+  let note = noteId ? await api(`/api/notes/${noteId}`) : null;
+  // money is edited as a dollar string ("12.50"); the server converts it to cents
+  const forEdit = (p) => (p.type === "money" && p.value != null ? { ...p, value: (p.value / 100).toFixed(2) } : { ...p });
+  let props = note ? note.properties.map(forEdit)
+    : (folderId ? (FOLDERS.find((f) => f.id === folderId)?.template || []).map((t) => ({ ...t, value: null })) : []);
+  let folderIds = note ? note.folders.map((f) => f.id) : (folderId ? [folderId] : []);
+  const m = modal({
+    title: note ? "Edit note" : "New note", wide: true,
+    body: `<div style="display:flex;gap:10px;align-items:center"><input id="n-title" value="${esc(note?.title || "")}" placeholder="Title"
+        style="flex:1;font-size:17px;font-weight:600"><label class="check small"><input type="checkbox" id="n-pin" ${note?.pinned ? "checked" : ""}> 📌 Pin</label></div>
+      <h3 style="margin-top:16px">Fields</h3>
+      <div id="props" class="props"></div>
+      <div class="actions" style="margin-top:8px"><button class="ghost small" id="p-add">＋ Add field</button>
+        <span class="muted small">Name it anything (Serial #, Due date, Rating…) and pick its type.</span></div>
+      <h3 style="margin-top:16px">Notes</h3>
+      <textarea id="n-body" rows="8" placeholder="Anything you want to remember…" style="width:100%">${esc(note?.body || "")}</textarea>
+      <div class="list-row" style="margin-top:10px"><span class="muted small">Folders:</span><span id="n-folders" style="flex:1" class="actions"></span>
+        <button class="ghost small" id="n-fold">Change…</button></div>`,
+    foot: `${note ? `<button class="ghost danger" data-del>Delete</button><button class="ghost" data-hist>History</button><span class="spacer"></span>` : ""}
+      <button class="ghost" data-close>Cancel</button><button data-save>${note ? "Save" : "Create note"}</button>`,
+  });
+  const renderFolders = () => {
+    m.$("#n-folders").innerHTML = folderIds.map((id) => { const f = FOLDERS.find((x) => x.id === id);
+      return f ? `<span class="pill" style="border-color:${esc(f.color)}">${esc(f.icon)} ${esc(f.name)}</span>` : ""; }).join("") || `<span class="muted small">none</span>`;
+  };
+  const render = () => {
+    m.$("#props").innerHTML = props.map((p, i) => `<div class="prop-row" data-i="${i}">
+      <input class="prop-name" data-k="name" value="${esc(p.name)}" placeholder="Field name">
+      <select data-k="type">${Object.entries(PROP_TYPES).map(([k, l]) => `<option value="${k}" ${p.type === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+      <div class="prop-val">${propInput(p, i)}</div>
+      <span class="prop-tools"><button class="icon-btn" data-up title="Move up">↑</button><button class="icon-btn" data-rm title="Remove field">✕</button></span>
+      <span class="field-error" data-err-p="${i}"></span></div>`).join("") || `<div class="muted small">No fields yet. Add one below.</div>`;
+  };
+  const readValues = () => m.$$("[data-v]").forEach((el) => {
+    const p = props[+el.dataset.v];
+    p.value = el.type === "checkbox" ? el.checked : el.value;
+  });
+  render(); renderFolders();
+  m.$("#props").addEventListener("input", (e) => {
+    const r = e.target.closest("[data-i]"); const k = e.target.dataset.k; if (!r || !k) return;
+    readValues();
+    const p = props[+r.dataset.i];
+    if (k === "type") {
+      const wasBool = p.type === "boolean";
+      p.type = e.target.value;
+      if (p.type === "boolean") p.value = !!p.value && p.value !== "false";
+      else if (wasBool) p.value = "";
+      render();
+    } else p[k] = e.target.value;
+  });
+  m.$("#props").addEventListener("click", (e) => {
+    const r = e.target.closest("[data-i]"); if (!r) return; const i = +r.dataset.i; readValues();
+    if (e.target.closest("[data-rm]")) { props.splice(i, 1); render(); }
+    if (e.target.closest("[data-up]") && i > 0) { [props[i - 1], props[i]] = [props[i], props[i - 1]]; render(); }
+  });
+  m.$("#p-add").onclick = () => { readValues(); props.push({ name: "", type: "text", value: null }); render(); m.$$(".prop-name").at(-1).focus(); };
+  m.$("#n-fold").onclick = async () => {
+    const r = await folderPicker({ title: "Folders for this note", selected: folderIds });
+    if (r !== undefined) { folderIds = r; renderFolders(); }
+  };
+  m.$("[data-save]").onclick = async () => {
+    readValues();
+    const outProps = props.filter((p) => p.name.trim()).map((p) => ({ name: p.name, type: p.type, value: p.value }));
+    const b = { title: m.$("#n-title").value, body: m.$("#n-body").value, pinned: m.$("#n-pin").checked, properties: outProps };
+    try {
+      if (note) note = await api(`/api/notes/${note.id}`, { method: "PATCH", body: { ...b, folder_ids: folderIds } });
+      else {
+        note = await api("/api/notes", { method: "POST", body: { ...b, folder_id: folderIds[0] ?? null } });
+        if (folderIds.length > 1) await api(`/api/items/note/${note.id}/folders`, { method: "PUT", body: { folder_ids: folderIds } });
+      }
+      m.close(); toast("Note saved"); loadFolders(); onSaved?.(note);
+    } catch (e) {
+      const msg = e.fields?.properties || e.fields?.title || e.message;
+      toast(msg, "error");
+    }
+  };
+  m.$("[data-hist]")?.addEventListener("click", () => historyModal("notes", note.id, note.title).catch(fail));
+  m.$("[data-del]")?.addEventListener("click", async () => {
+    if (!(await confirmBox(`Delete “${note.title}”? You can restore it from Data › Recently deleted.`))) return;
+    await api(`/api/notes/${note.id}`, { method: "DELETE" }).catch(fail);
+    m.close(); toast("Note deleted"); loadFolders(); onSaved?.(null);
+  });
+  setTimeout(() => m.$("#n-title").focus(), 40);
+}
+
+// ---- item picker: add existing things of any type to a folder
+function itemPicker(folderId, onDone) {
+  let type = "contact";
+  const chosen = new Map();
+  const m = modal({
+    title: "Add existing items", wide: true,
+    body: `<div class="seg" id="ip-types" style="flex-wrap:wrap">${Object.entries(ITEM_KINDS).map(([k, v]) =>
+      `<button data-t="${k}" class="${k === type ? "on" : ""}">${v.icon} ${v.label}</button>`).join("")}</div>
+      <input type="search" id="ip-q" placeholder="Search…" style="width:100%;margin:12px 0">
+      <div id="ip-list" class="pick-list"></div>`,
+    foot: `<span class="muted small" id="ip-count">0 selected</span><span class="spacer"></span><button class="ghost" data-close>Cancel</button><button data-ok>Add to folder</button>`,
+  });
+  const load = async () => {
+    const items = await api(`/api/items/lookup?${qs({ type, q: m.$("#ip-q").value, limit: 50 })}`);
+    m.$("#ip-list").innerHTML = items.map((it) => `<label class="pick-item"><input type="checkbox" data-key="${it.item_type}:${it.id}" ${chosen.has(`${it.item_type}:${it.id}`) ? "checked" : ""}>
+      ${it.thumb ? `<img src="${esc(it.thumb)}" alt="">` : `<span class="pick-ico">${ITEM_KINDS[it.item_type].icon}</span>`}
+      <span><b>${esc(it.title)}</b><div class="muted small">${esc(it.subtitle || "")}</div></span></label>`).join("")
+      || `<div class="empty">Nothing found</div>`;
+  };
+  m.$("#ip-types").addEventListener("click", (e) => { const b = e.target.closest("[data-t]"); if (!b) return;
+    type = b.dataset.t; m.$$("#ip-types button").forEach((x) => x.classList.toggle("on", x === b)); load(); });
+  m.$("#ip-q").addEventListener("input", debounce(load, 200));
+  m.$("#ip-list").addEventListener("change", (e) => {
+    const k = e.target.dataset.key; if (!k) return;
+    if (e.target.checked) chosen.set(k, true); else chosen.delete(k);
+    m.$("#ip-count").textContent = `${chosen.size} selected`;
+  });
+  m.$("[data-ok]").onclick = async () => {
+    if (!chosen.size) return m.close();
+    const items = [...chosen.keys()].map((k) => { const [t, id] = k.split(":"); return { item_type: t, item_id: +id }; });
+    try { const r = await api(`/api/folders/${folderId}/items`, { method: "POST", body: { items } });
+      m.close(); toast(`Added ${r.added} item${r.added === 1 ? "" : "s"}`); onDone(); } catch (e) { fail(e); }
+  };
+  load();
+}
+
+async function uploadFiles(fileList, folderId) {
+  const fd = new FormData();
+  [...fileList].forEach((f) => fd.append("file", f));
+  if (folderId) fd.append("folder_id", folderId);
+  // images go to Pictures (thumbnails, EXIF); everything else is a File
+  const imgs = [...fileList].filter((f) => /^image\/(jpeg|png|gif|webp|bmp|tiff|heic|heif)$/.test(f.type) || /\.(heic|heif)$/i.test(f.name));
+  const docs = [...fileList].filter((f) => !imgs.includes(f));
+  let n = 0;
+  if (docs.length) {
+    const d = new FormData(); docs.forEach((f) => d.append("file", f)); if (folderId) d.append("folder_id", folderId);
+    const r = await api("/api/files", { method: "POST", form: d }); n += r.items.length;
+    r.errors.forEach((e) => toast(`${e.name}: ${Object.values(e.errors).join("; ")}`, "error"));
+  }
+  if (imgs.length) {
+    const r = await uploadPictures(imgs);
+    if (folderId && r.items.length) await api(`/api/folders/${folderId}/items`, { method: "POST",
+      body: { items: r.items.map((p) => ({ item_type: "picture", item_id: p.id })) } });
+    n += r.items.length;
+  }
+  if (docs.length) toast(`Uploaded ${n} item${n === 1 ? "" : "s"}`);
+  return n;
+}
+
+function itemCard(it, folderId) {
+  const k = ITEM_KINDS[it.item_type];
+  const vis = it.thumb ? `<img src="${esc(it.thumb)}" alt="" loading="lazy">`
+    : `<span class="card-ico">${it.item_type === "file" ? fileIcon(it.mime) : k.icon}</span>`;
+  return `<div class="item-card" draggable="true" data-type="${it.item_type}" data-id="${it.id}" data-href="${esc(it.href)}">
+    <div class="item-vis ${it.item_type === "code" ? "code" : ""}">${vis}</div>
+    <div class="item-meta"><div class="item-title">${it.pinned ? "📌 " : ""}${esc(it.title)}</div>
+      <div class="muted small item-sub">${esc(it.subtitle || "")}</div></div>
+    <div class="item-foot"><span class="pill">${k.icon} ${k.one}</span>
+      ${folderId ? `<span><button class="icon-btn" data-act="move" title="Move to another folder">⇄</button>
+      <button class="icon-btn" data-act="remove" title="Remove from this folder">✕</button></span>` : ""}</div></div>`;
+}
+
+function openItem(card) {
+  const { type, id, href } = card.dataset;
+  if (type === "note") return noteEditor(+id, { onSaved: () => navigate() });
+  if (type === "file") return window.open(`/files/${id}/view`, "_blank", "noopener");
+  location.hash = href.slice(1);
+}
+
+route("/folders", async (el) => {
+  await loadFolders();
+  const top = FOLDERS.filter((f) => f.parent_id == null);
+  const unfiled = await api("/api/notes?unfiled=1&limit=1");
+  el.innerHTML = `
+    <div class="page-head"><div><h1>Folders</h1><p>Group anything together: notes with your own fields, files, contacts, pictures, expenses, codes and records.</p></div>
+      <div class="actions"><button class="ghost" id="new-note">＋ Note</button><button id="new">＋ New folder</button></div></div>
+    <div class="folder-grid">${top.map(folderTile).join("")}
+      <a class="folder-tile ghosted" href="#/notes?unfiled=1"><span class="ft-icon">🗂</span><b>Unfiled notes</b><span class="muted small">${unfiled.total}</span></a></div>
+    ${top.length ? "" : `<div class="card empty" style="margin-top:16px"><b>No folders yet</b>Create one, e.g. “Car”, “Taxes 2026”, “Recipes”, “Pets” — then fill it with any mix of information.</div>`}`;
+  $("#new", el).onclick = () => folderForm(null, null, (f) => (location.hash = `#/folders/${f.id}`));
+  $("#new-note", el).onclick = () => noteEditor(null, { onSaved: () => navigate() });
+});
+
+function folderTile(f) {
+  return `<a class="folder-tile" href="#/folders/${f.id}" data-drop-folder="${f.id}" style="--fc:${esc(f.color)}">
+    <span class="ft-icon">${esc(f.icon)}</span><b>${esc(f.name)}</b>
+    <span class="muted small">${f.total_items} item${f.total_items === 1 ? "" : "s"}${f.folder_count ? ` · ${f.folder_count} folder${f.folder_count === 1 ? "" : "s"}` : ""}</span></a>`;
+}
+
+route("/folders/(\\d+)", async (el, id) => {
+  const fid = +id;
+  const state = { type: "", q: "" };
+  await loadFolders();
+  let f = await api(`/api/folders/${fid}`);
+  const shell = () => {
+    el.innerHTML = `
+      <div class="crumbs"><a href="#/folders">Folders</a>${f.path.map((p, i) => i === f.path.length - 1 ? ` › <b>${esc(p.icon)} ${esc(p.name)}</b>`
+        : ` › <a href="#/folders/${p.id}" data-drop-folder="${p.id}">${esc(p.icon)} ${esc(p.name)}</a>`).join("")}</div>
+      <div class="page-head folder-head" style="--fc:${esc(f.color)}"><div><h1><span class="fh-icon">${esc(f.icon)}</span> ${esc(f.name)}</h1>
+        <p>${esc(f.description || "")}${f.template.length ? ` <span class="pill" title="New notes start with these fields">template: ${esc(f.template.map((t) => t.name).join(", "))}</span>` : ""}</p></div>
+        <div class="actions"><button class="ghost" id="edit">Edit folder</button><button class="ghost" id="add">＋ Existing…</button>
+          <label class="btn ghost">⤒ Upload<input type="file" multiple hidden id="up"></label>
+          <button class="ghost" id="sub">＋ Subfolder</button><button id="note">＋ Note</button></div></div>
+      <div class="toolbar"><input type="search" id="q" placeholder="Search this folder…" value="${esc(state.q)}">
+        <div class="seg" id="types"><button data-t="" class="${state.type ? "" : "on"}">All</button>${Object.entries(ITEM_KINDS)
+          .filter(([k]) => f.type_counts[k]).map(([k, v]) => `<button data-t="${k}" class="${state.type === k ? "on" : ""}">${v.icon} ${v.label} ${f.type_counts[k]}</button>`).join("")}</div></div>
+      ${f.subfolders.length ? `<div class="folder-grid" style="margin-bottom:18px">${f.subfolders.map(folderTile).join("")}</div>` : ""}
+      <div class="item-grid" id="items">${f.items.map((it) => itemCard(it, fid)).join("")}</div>
+      ${f.items.length ? "" : `<div class="card empty drop-hint"><b>${state.q || state.type ? "Nothing matches" : "This folder is empty"}</b>
+        Add a note, drop files anywhere on this page, or use “＋ Existing…” to add contacts, pictures, expenses, codes or records.</div>`}`;
+    bind();
+  };
+  const reload = async () => { f = await api(`/api/folders/${fid}?${qs({ type: state.type, q: state.q })}`); await loadFolders(); shell(); };
+  const bind = () => {
+    $("#edit", el).onclick = () => folderForm(f, null, () => reload());
+    $("#sub", el).onclick = () => folderForm(null, fid, () => reload());
+    $("#note", el).onclick = () => noteEditor(null, { folderId: fid, onSaved: reload });
+    $("#add", el).onclick = () => itemPicker(fid, reload);
+    $("#up", el).onchange = async (e) => { if (e.target.files.length) { await uploadFiles(e.target.files, fid).catch(fail); reload(); } };
+    $("#q", el).addEventListener("input", debounce((e) => { state.q = e.target.value; reload().then(() => { const q = $("#q", el); q.focus(); q.setSelectionRange(q.value.length, q.value.length); }); }, 250));
+    $("#types", el).addEventListener("click", (e) => { const b = e.target.closest("[data-t]"); if (b) { state.type = b.dataset.t; reload(); } });
+    $("#items", el).addEventListener("click", async (e) => {
+      const card = e.target.closest(".item-card"); if (!card) return;
+      const act = e.target.closest("[data-act]")?.dataset.act;
+      const { type, id: itemId } = card.dataset;
+      if (act === "remove") {
+        await api(`/api/folders/${fid}/items/${type}/${itemId}`, { method: "DELETE" }).catch(fail);
+        toast("Removed from folder (the item itself still exists)"); return reload();
+      }
+      if (act === "move") {
+        const to = await folderPicker({ title: "Move to…", single: true, exclude: null });
+        if (to && to !== fid) { await api(`/api/folders/${fid}/items/${type}/${itemId}/move`, { method: "POST", body: { to_folder: to } }).catch(fail); toast("Moved"); reload(); }
+        return;
+      }
+      openItem(card);
+    });
+  };
+  // drag an item onto a subfolder/breadcrumb to move it; drop files from the desktop to upload
+  const onDragStart = (e) => { const c = e.target.closest?.(".item-card"); if (c) e.dataTransfer.setData("text/x-dv-item", `${c.dataset.type}:${c.dataset.id}`); };
+  const onDragOver = (e) => {
+    const isFiles = e.dataTransfer.types.includes("Files"), isItem = e.dataTransfer.types.includes("text/x-dv-item");
+    if (!isFiles && !isItem) return;
+    e.preventDefault();
+    $$(".drop-over", el).forEach((x) => x.classList.remove("drop-over"));
+    const t = isItem ? e.target.closest("[data-drop-folder]") : el;
+    t?.classList.add("drop-over");
+  };
+  const onDrop = async (e) => {
+    $$(".drop-over", el).forEach((x) => x.classList.remove("drop-over")); el.classList.remove("drop-over");
+    if (e.dataTransfer.files.length) { e.preventDefault(); await uploadFiles(e.dataTransfer.files, fid).catch(fail); return reload(); }
+    const item = e.dataTransfer.getData("text/x-dv-item"); const target = e.target.closest("[data-drop-folder]");
+    if (item && target && +target.dataset.dropFolder !== fid) {
+      e.preventDefault();
+      const [type, itemId] = item.split(":");
+      await api(`/api/folders/${fid}/items/${type}/${itemId}/move`, { method: "POST", body: { to_folder: +target.dataset.dropFolder } }).catch(fail);
+      toast("Moved"); reload();
+    }
+  };
+  const onDragLeave = (e) => { if (e.target === el) el.classList.remove("drop-over"); };
+  el.addEventListener("dragstart", onDragStart); el.addEventListener("dragover", onDragOver);
+  el.addEventListener("drop", onDrop); el.addEventListener("dragleave", onDragLeave);
+  shell();
+  markFolderNav();
+  return () => { el.removeEventListener("dragstart", onDragStart); el.removeEventListener("dragover", onDragOver);
+    el.removeEventListener("drop", onDrop); el.removeEventListener("dragleave", onDragLeave); };
+});
+
+// ---- all notes & files (including unfiled ones)
+route("/notes(?:/(\\d+))?", async (el, id, params) => {
+  await loadFolders();
+  const state = { q: "", unfiled: params.unfiled === "1", tab: params.tab || "notes" };
+  el.innerHTML = `
+    <div class="page-head"><div><h1>Notes &amp; Files</h1><p>Everything you've written or attached, whether or not it's in a folder.</p></div>
+      <div class="actions"><label class="btn ghost">⤒ Upload files<input type="file" multiple hidden id="up"></label><button id="new">＋ Note</button></div></div>
+    <div class="toolbar"><div class="seg" id="tabs"><button data-tab="notes">✎ Notes</button><button data-tab="files">📄 Files</button></div>
+      <input type="search" id="q" placeholder="Search…"><label class="check small" id="unf-wrap"><input type="checkbox" id="unf" ${state.unfiled ? "checked" : ""}> Only unfiled</label>
+      <span class="muted small" id="count"></span></div>
+    <div class="item-grid" id="items"></div>`;
+  const load = async () => {
+    $$("#tabs button", el).forEach((b) => b.classList.toggle("on", b.dataset.tab === state.tab));
+    $("#unf-wrap", el).hidden = state.tab !== "notes";
+    let cards;
+    if (state.tab === "notes") {
+      const r = await api(`/api/notes?${qs({ q: state.q, unfiled: state.unfiled ? 1 : "" })}`);
+      $("#count", el).textContent = `${r.total} note${r.total === 1 ? "" : "s"}`;
+      cards = r.items.map((n) => ({ item_type: "note", id: n.id, title: n.title, pinned: n.pinned, href: `#/notes/${n.id}`,
+        subtitle: [n.folders.map((x) => `${x.icon} ${x.name}`).join(", "), n.properties.filter((p) => p.value != null && p.value !== "").length
+          ? `${n.properties.filter((p) => p.value != null && p.value !== "").length} fields` : "", (n.body.split("\n")[0] || "").slice(0, 80)].filter(Boolean).join(" · ") }));
+    } else {
+      const r = await api(`/api/files?${qs({ q: state.q })}`);
+      $("#count", el).textContent = `${r.total} file${r.total === 1 ? "" : "s"}`;
+      cards = r.items.map((x) => ({ item_type: "file", id: x.id, title: x.original_name, mime: x.mime, href: `/files/${x.id}/download`,
+        subtitle: `${fmtBytes(x.size_bytes)} · ${x.mime}` }));
+    }
+    $("#items", el).innerHTML = cards.map((c) => itemCard(c, null).replace('<div class="item-foot">',
+      `<div class="item-foot">${c.item_type === "file" ? `<span><a class="icon-btn" href="/files/${c.id}/download" title="Download">⤓</a>
+        <button class="icon-btn" data-act="folders" title="Folders">📁</button><button class="icon-btn" data-act="del-file" title="Delete file">🗑</button></span>` : ""}`)).join("")
+      || `<div class="card empty" style="grid-column:1/-1"><b>Nothing here yet</b></div>`;
+  };
+  $("#tabs", el).addEventListener("click", (e) => { const b = e.target.closest("[data-tab]"); if (b) { state.tab = b.dataset.tab; load(); } });
+  $("#q", el).addEventListener("input", debounce((e) => { state.q = e.target.value; load(); }, 250));
+  $("#unf", el).onchange = (e) => { state.unfiled = e.target.checked; load(); };
+  $("#new", el).onclick = () => noteEditor(null, { onSaved: load });
+  $("#up", el).onchange = async (e) => { if (e.target.files.length) { await uploadFiles(e.target.files, null).catch(fail); state.tab = "files"; load(); } };
+  $("#items", el).addEventListener("click", async (e) => {
+    if (e.target.closest("a")) return;
+    const card = e.target.closest(".item-card"); if (!card) return;
+    const act = e.target.closest("[data-act]")?.dataset.act;
+    if (act === "folders") return editItemFolders("file", +card.dataset.id).then(load).catch(fail);
+    if (act === "del-file") {
+      if (!(await confirmBox("Delete this file permanently? (Files can't be restored from Recently deleted.)"))) return;
+      await api(`/api/files/${card.dataset.id}`, { method: "DELETE" }).catch(fail); toast("File deleted"); return load();
+    }
+    if (card.dataset.type === "note") return noteEditor(+card.dataset.id, { onSaved: load });
+    openItem(card);
+  });
+  await load();
+  if (id) noteEditor(+id, { onSaved: () => { history.replaceState(null, "", "#/notes"); load(); } }).catch(fail);
 });
 
 // ============================================================ SQL console
@@ -1285,13 +1781,16 @@ route("/data", async (el, params) => {
 // ========================================================= global search
 function setupSearch() {
   const input = $("#global-search"), box = $("#search-results");
-  const icons = { contact: "☺", picture: "▣", expense: "$", code: "▦", record: "📁" };
+  const icons = { contact: "☺", picture: "▣", expense: "$", code: "▦", record: "📁", note: "✎", file: "📄", folder: "🗂" };
   let items = [], sel = -1;
   const hrefFor = async (r) => {
     if (r.kind === "contact") return `#/contacts/${r.ref_id}`;
     if (r.kind === "picture") return `#/pictures?open=${r.ref_id}`;
     if (r.kind === "expense") return `#/expenses?edit=${r.ref_id}`;
     if (r.kind === "code") return `#/codes`;
+    if (r.kind === "note") return `#/notes/${r.ref_id}`;
+    if (r.kind === "folder") return `#/folders/${r.ref_id}`;
+    if (r.kind === "file") { window.open(`/files/${r.ref_id}/view`, "_blank", "noopener"); return location.hash; }
     const rec = await api(`/api/records/${r.ref_id}`).catch(() => null);
     if (!rec) return "#/";
     const s = await api(`/api/sections/${rec.section_id}`);
@@ -1341,8 +1840,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupSearch();
   $("#menu-btn").onclick = () => $("#sidebar").classList.toggle("open");
   $("#new-section").onclick = () => sectionBuilder(null).catch(fail);
-  window.addEventListener("hashchange", () => { navigate(); loadSectionNav().catch(() => {}); });
-  await loadSectionNav().catch(fail);
+  $("#new-folder").onclick = () => folderForm(null, null, (f) => (location.hash = `#/folders/${f.id}`)).catch(fail);
+  window.addEventListener("hashchange", () => { navigate(); loadSectionNav().catch(() => {}); markFolderNav(); });
+  await Promise.all([loadSectionNav(), loadFolders()]).catch(fail);
   api("/api/stats").then((s) => ($("#db-meta").textContent = `${fmtBytes(s.db_bytes)} · v${s.schema_version}`)).catch(() => {});
   navigate();
 });

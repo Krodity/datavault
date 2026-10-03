@@ -8,15 +8,17 @@ from .db import transaction
 from .validation import NotFound, ValidationError
 
 # tables a user can browse history for / restore rows into
-HISTORY_TABLES = {"contacts", "expenses", "codes", "section_records", "pictures", "sections", "expense_categories"}
-# pictures are excluded from restore: their files are removed from disk on delete
-RESTORABLE = {"contacts", "expenses", "codes", "section_records"}
+HISTORY_TABLES = {"contacts", "expenses", "codes", "section_records", "pictures", "sections", "expense_categories",
+                  "notes", "files", "folders"}
+# pictures/files are excluded from restore: their bytes are removed from disk on delete
+RESTORABLE = {"contacts", "expenses", "codes", "section_records", "notes"}
 # column -> table it must still point at; dangling references are cleared on restore
 FOREIGN_KEYS = {
     "contacts": {"photo_id": "pictures"},
     "expenses": {"category_id": "expense_categories", "contact_id": "contacts", "receipt_picture_id": "pictures"},
     "section_records": {},
     "codes": {},
+    "notes": {},
 }
 HIDDEN = {"updated_at", "created_at", "sha256", "stored_name"}
 
@@ -121,6 +123,14 @@ def restore_deleted(conn, audit_id: int) -> dict:
         if table == "contacts" and old.get("tags"):
             tags = _load(old["tags"]) if isinstance(old["tags"], str) else old["tags"]
             repo._set_contact_tags(conn, values["id"], tags)
+        if table == "notes" and old.get("folders"):  # put it back in the folders it was filed in
+            folder_ids = _load(old["folders"]) if isinstance(old["folders"], str) else old["folders"]
+            for fid in folder_ids or []:
+                if conn.execute("SELECT 1 FROM folders WHERE id = ?", (fid,)).fetchone():
+                    conn.execute("INSERT OR IGNORE INTO folder_items (folder_id, item_type, item_id) VALUES (?, 'note', ?)",
+                                 (fid, values["id"]))
+                else:
+                    notes.append(f"folder {fid} no longer exists")
     return {"table": table, "id": values["id"], "notes": notes}
 
 

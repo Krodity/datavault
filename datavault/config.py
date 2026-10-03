@@ -30,9 +30,13 @@ class Config:
         return self.home / "thumbs"
 
     @property
+    def files_dir(self) -> Path:
+        return self.home / "files"
+
+    @property
     def backups_dir(self) -> Path:
         return self.home / "backups"
 
     def ensure_dirs(self) -> None:
-        for d in (self.home, self.media_dir, self.thumbs_dir, self.backups_dir):
+        for d in (self.home, self.media_dir, self.thumbs_dir, self.files_dir, self.backups_dir):
             d.mkdir(parents=True, exist_ok=True)

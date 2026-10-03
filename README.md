@@ -1,10 +1,10 @@
 # DataVault
 
-A personal, local-first database app for **contacts, pictures, expenses, barcodes / QR codes, and user-defined sections**. It is built on SQLite, with a Python data layer, a REST API, a CLI, and a dependency-free web frontend.
+A personal, local-first database app for **contacts, pictures, expenses, barcodes / QR codes, user-defined sections, and nested folders that hold any mix of them, plus notes with your own fields and file attachments**. It is built on SQLite, with a Python data layer, a REST API, a CLI, and a dependency-free web frontend.
 
 The project is about **moving data in and out correctly**: validating it at the boundary, storing it in a well-constrained schema, querying it efficiently, and getting it back out in standard formats without loss.
 
-![stack](https://img.shields.io/badge/python-3.11+-blue) ![db](https://img.shields.io/badge/SQLite-FTS5%20%7C%20JSON1%20%7C%20WAL-003b57) [![CI](https://github.com/Krodity/datavault/actions/workflows/ci.yml/badge.svg)](https://github.com/Krodity/datavault/actions/workflows/ci.yml) ![tests](https://img.shields.io/badge/tests-134%20passing-brightgreen)
+![stack](https://img.shields.io/badge/python-3.11+-blue) ![db](https://img.shields.io/badge/SQLite-FTS5%20%7C%20JSON1%20%7C%20WAL-003b57) [![CI](https://github.com/Krodity/datavault/actions/workflows/ci.yml/badge.svg)](https://github.com/Krodity/datavault/actions/workflows/ci.yml) ![tests](https://img.shields.io/badge/tests-148%20passing-brightgreen)
 
 ---
 
@@ -16,6 +16,9 @@ The project is about **moving data in and out correctly**: validating it at the 
 | **Pictures** | Content-addressed storage (SHA-256 dedup), EXIF date and camera extraction, thumbnails, albums. **iPhone photos work:** both MPO JPEGs and HEIC, with a browser-viewable JPEG copy. Decompression-bomb guard and integrity sweep |
 | **Expenses** | Integer-cent money, categories with monthly budgets, receipt photos, 12-month trend, budget-vs-actual, top merchants, **subscription detection** (window functions), filters and pagination |
 | **Barcodes / QR** | Generate QR, EAN-13/8, UPC-A, Code 128/39, and ISBN-13 (check digits computed and verified), Wi-Fi QR builder, PNG/SVG export, decode from photos or a **live webcam** |
+| **Folders** | Nested folders, as deep as you want, each with its own icon, color and **field template**. A folder can hold any mix of items: notes, files, contacts, pictures, expenses, codes and section records. An item can live in several folders, and deleting a folder never deletes what's inside. You can drag items between folders, drop files onto a folder to upload them, and filter or search inside a folder |
+| **Notes** | Free-form items with a title, body and **user-defined fields**: name a field anything and give it a type (text, number, money, date, yes/no, link, email or phone). New notes start from their folder's template. Notes are searchable, including their field values |
+| **Files** | Any document up to 100 MB (PDF, spreadsheets, archives…). Files are content-addressed and de-duplicated, and the MIME type comes from the extension rather than the browser. Only an allow-list of types is viewed inline; everything else downloads under a sandboxed CSP |
 | **Custom sections** | Define your own "tables" in the UI (13 field types: text, money, date, select, picture/contact/code links, **formulas**, …). Records are validated JSON documents. Sort and filter on any field; numeric columns get totals |
 | **Formulas** | Spreadsheet-style computed fields: `price * quantity`, `IF(status = "Owned", price, 0)`, `DAYS_BETWEEN(TODAY(), warranty_until)`, `first & " " & last`. Around 35 functions, exact Decimal math, dependency-ordered evaluation with cycle detection, and live validation in the field builder. Results are stored, so they can be sorted and queried in SQL |
 | **SQL console** | Read-only, sandboxed, time-boxed SQL with a schema browser, `EXPLAIN QUERY PLAN`, saved queries, example analytics (window functions, CTEs, FTS), and CSV export |
@@ -60,7 +63,8 @@ datavault history --restore 345    # … and undo one
 datavault/
 ├── migrations/          versioned schema: 0001_init.sql, 0002_search_and_audit.py (generates triggers),
 │                        0003_formulas_and_perf.py (table rebuild, rowid-keyed FTS, FK indexes),
-│                        0004_audit_snapshots.py (before/after JSON snapshots in triggers)
+│                        0004_audit_snapshots.py (before/after JSON snapshots in triggers),
+│                        0005_folders_notes_files.py (folder tree, polymorphic membership, notes, files)
 ├── db.py                connection setup (WAL, FKs, busy timeout), transactions + savepoints, migration runner
 ├── validation.py        one Schema per entity; the API, CLI and importers share the same rules
 ├── repo.py              data-access layer: parameterized SQL, allow-listed identifiers
@@ -68,6 +72,7 @@ datavault/
 ├── codes.py             barcode/QR validation, rendering, decoding (pyzbar)
 ├── formulas.py          safe formula engine (AST whitelist, Decimal math, dependency graph)
 ├── history.py           change history (field diffs) and undelete from audit snapshots
+├── folders.py           folder tree, any-type membership, notes with custom fields, file attachments
 ├── query.py             sandboxed read-only SQL console
 ├── transfer.py          CSV/vCard/JSON import-export, backup/restore
 ├── web.py               Flask REST API (≈60 endpoints) + security headers
@@ -96,6 +101,12 @@ datavault/
   - `FULL OUTER JOIN` drives budget-vs-actual
   - the subscription detector partitions by merchant and uses `LAG()` to count consecutive months, with a variance bound on the amount
   - window functions (`LAG`, `RANK`, running `SUM`) power the example queries
+- **Folders as a graph problem:**
+  - the tree is an adjacency list (`parent_id`)
+  - breadcrumbs and "move" cycle checks use recursive CTEs that walk up and down the tree
+  - per-folder totals count the distinct items across all descendants
+  - membership is **polymorphic** (`item_type, item_id`); since that can't carry a `FOREIGN KEY`, generated `AFTER DELETE` triggers on every item table enforce the integrity
+  - a folder's items are resolved with **one query per item type**, not one per item
 - **Merging** duplicate contacts runs in one transaction. It fills blank fields, unions tags, and re-points expenses and contact fields stored inside JSON documents (`json_set` with a bound path). A failure leaves nothing half-merged.
 - **Migrations:** version tracking uses `PRAGMA user_version`, and each migration runs in its own transaction. SQL files are split with `sqlite3.complete_statement`, so trigger bodies survive.
 
@@ -135,6 +146,19 @@ The tests cover the following:
 - section CSV round-trips
 - MPO and HEIC photo uploads
 - backup pruning that is limited to its own label
+- folders:
+  - nesting
+  - cycle prevention
+  - de-duplicated recursive counts
+  - cleanup triggers
+  - notes with typed custom fields
+  - template seeding
+  - restoring a deleted note into its folders
+- files:
+  - de-duplication
+  - path-stripped names
+  - HTML never rendered inline
+  - inclusion in backup and restore
 - regression tests for every bug found in a code audit:
   - `NaN` and `Infinity` amounts
   - Unicode stored inside JSON documents

@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, Response, abort, g, jsonify, request, send_file, send_from_directory
 from werkzeug.exceptions import HTTPException
 
-from . import codes, formulas, history, media, repo, transfer
+from . import codes, folders, formulas, history, media, repo, transfer
 from .config import Config
 from .db import connect, migrate
 from .query import EXAMPLES, QueryRunner
@@ -523,6 +523,138 @@ def create_app(cfg: Config | None = None, *, allowed_hosts: set[str] | None = No
         if "/" in name or not name.startswith("datavault-") or not name.endswith(".zip"):
             abort(404)
         return send_from_directory(cfg.backups_dir, name, as_attachment=True)
+
+    # ---------------------------------------------------- folders & notes
+    @app.get("/api/folders")
+    def folders_list():
+        return jsonify(folders.list_folders(db()))
+
+    @app.post("/api/folders")
+    def folders_create():
+        return created(folders.create_folder(db(), body()))
+
+    @app.get("/api/folders/<int:fid>")
+    def folders_get(fid):
+        """A folder with its breadcrumb path, subfolders and resolved items."""
+        return jsonify(folders.get_folder(db(), fid, item_type=request.args.get("type", ""),
+                                          q=request.args.get("q", "")))
+
+    @app.patch("/api/folders/<int:fid>")
+    def folders_update(fid):
+        return jsonify(folders.update_folder(db(), fid, body()))
+
+    @app.delete("/api/folders/<int:fid>")
+    def folders_delete(fid):
+        return jsonify(folders.delete_folder(db(), fid))
+
+    @app.post("/api/folders/<int:fid>/items")
+    def folders_add(fid):
+        b = body()
+        return jsonify(folders.add_items(db(), fid, b.get("items", b)))
+
+    @app.delete("/api/folders/<int:fid>/items/<item_type>/<int:item_id>")
+    def folders_remove(fid, item_type, item_id):
+        folders.remove_item(db(), fid, item_type, item_id)
+        return "", 204
+
+    @app.post("/api/folders/<int:fid>/items/<item_type>/<int:item_id>/move")
+    def folders_move(fid, item_type, item_id):
+        to = repo._filter_value("to_folder", repo.v.fk, body().get("to_folder"))
+        if to is None:
+            raise ValidationError({"to_folder": "is required"})
+        folders.move_item(db(), fid, to, item_type, item_id)
+        return "", 204
+
+    @app.put("/api/folders/<int:fid>/order")
+    def folders_order(fid):
+        folders.reorder_items(db(), fid, body().get("order"))
+        return "", 204
+
+    @app.get("/api/items/<item_type>/<int:item_id>/folders")
+    def item_folders(item_type, item_id):
+        return jsonify(folders.folders_of(db(), item_type, item_id))
+
+    @app.put("/api/items/<item_type>/<int:item_id>/folders")
+    def item_folders_set(item_type, item_id):
+        return jsonify(folders.set_item_folders(db(), item_type, item_id, body().get("folder_ids")))
+
+    @app.get("/api/items/lookup")
+    def items_lookup():
+        return jsonify(folders.lookup(db(), request.args.get("type", ""), request.args.get("q", ""),
+                                      request.args.get("limit", 30)))
+
+    @app.get("/api/notes")
+    def notes_list():
+        return jsonify(folders.list_notes(db(), **args("q", "unfiled", "limit", "offset")))
+
+    @app.post("/api/notes")
+    def notes_create():
+        return created(folders.create_note(db(), body()))
+
+    @app.get("/api/notes/<int:nid>")
+    def notes_get(nid):
+        return jsonify(folders.get_note(db(), nid))
+
+    @app.patch("/api/notes/<int:nid>")
+    def notes_update(nid):
+        return jsonify(folders.update_note(db(), nid, body()))
+
+    @app.delete("/api/notes/<int:nid>")
+    def notes_delete(nid):
+        folders.delete_note(db(), nid)
+        return "", 204
+
+    @app.get("/api/files")
+    def files_list():
+        return jsonify(folders.list_files(db(), **args("q", "limit", "offset")))
+
+    @app.post("/api/files")
+    def files_upload():
+        uploads = request.files.getlist("file")
+        if not uploads:
+            raise ValidationError({"file": "no file uploaded"})
+        out, errors = [], []
+        for f in uploads:
+            try:
+                rec, new = folders.ingest_file(db(), cfg, f.read(), f.filename or "file",
+                                               description=request.form.get("description", ""),
+                                               folder_id=request.form.get("folder_id"))
+                out.append({**rec, "duplicate": not new})
+            except ValidationError as e:
+                errors.append({"name": f.filename, "errors": e.errors})
+        if not out and errors:
+            raise ValidationError(errors[0]["errors"])
+        return jsonify(items=out, errors=errors), 201
+
+    @app.get("/api/files/<int:file_id>")
+    def files_get(file_id):
+        return jsonify(folders.get_file(db(), file_id))
+
+    @app.patch("/api/files/<int:file_id>")
+    def files_update(file_id):
+        return jsonify(folders.update_file(db(), file_id, body()))
+
+    @app.delete("/api/files/<int:file_id>")
+    def files_delete(file_id):
+        folders.delete_file(db(), cfg, file_id)
+        return "", 204
+
+    @app.get("/files/<int:file_id>/<mode>")
+    def files_download(file_id, mode):
+        """Download (or, for a safe allow-list of types, view) an attached file."""
+        f = folders.get_file(db(), file_id)
+        path = folders.file_path(cfg, f["stored_name"])
+        if mode not in ("download", "view") or not path.exists():
+            abort(404)
+        inline = mode == "view" and f["inline"]
+        resp = send_file(path, mimetype=f["mime"] if inline else "application/octet-stream",
+                         as_attachment=not inline, download_name=f["original_name"], max_age=0)
+        # belt and braces: even if a browser sniffs, the CSP stops scripts. PDFs skip
+        # `sandbox` because Chrome's built-in viewer refuses to run in a sandboxed frame.
+        sandbox = "" if f["mime"] == "application/pdf" else "sandbox; "
+        resp.headers["Content-Security-Policy"] = (f"{sandbox}default-src 'none'; img-src 'self'; media-src 'self'; "
+                                                   "object-src 'self'; style-src 'unsafe-inline'")
+        return resp
 
     # ------------------------------------------------------ history/undo
     @app.get("/api/history/<table>/<int:row_id>")

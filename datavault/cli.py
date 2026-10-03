@@ -370,7 +370,58 @@ def cmd_seed(cfg, a):
     for name, sql in [("Spending this month by category", """SELECT category, printf('$%.2f', SUM(amount)) AS total
 FROM v_expenses WHERE month = strftime('%Y-%m', 'now') GROUP BY category ORDER BY SUM(amount) DESC;""")]:
         repo.save_query(conn, {"name": name, "sql": sql})
-    print(f"seeded {len(people)} contacts, {n} expenses, 6 codes, 3 pictures, 2 sections (with formula fields)")
+    _seed_folders(conn, cfg, cids, inv)
+    print(f"seeded {len(people)} contacts, {n} expenses, 6 codes, 3 pictures, 2 sections (with formula fields), "
+          "3 folders with notes, files and linked items")
+
+
+def _seed_folders(conn, cfg, cids, inv):
+    """Folders holding a mix of everything, with field templates."""
+    from . import folders as fo
+    car = fo.create_folder(conn, {"name": "Car", "icon": "🚗", "color": "#2563eb",
+                                  "description": "Everything about the Civic",
+                                  "template": [{"name": "Make", "type": "text"}, {"name": "Model", "type": "text"},
+                                               {"name": "VIN", "type": "text"}, {"name": "Insurance due", "type": "date"}]})
+    fo.create_note(conn, {"title": "2019 Honda Civic", "folder_id": car["id"], "pinned": True,
+                          "body": "Oil change every 5,000 miles. Tire rotation at the same time.",
+                          "properties": [{"name": "Make", "type": "text", "value": "Honda"},
+                                         {"name": "Model", "type": "text", "value": "Civic EX"},
+                                         {"name": "VIN", "type": "text", "value": "2HGFC2F69KH512345"},
+                                         {"name": "Insurance due", "type": "date",
+                                          "value": (date.today() + timedelta(days=45)).isoformat()},
+                                         {"name": "Mileage", "type": "number", "value": 48210},
+                                         {"name": "Paid off", "type": "boolean", "value": True}]})
+    log = "2026-03-02  Oil change (Hale & Sons)  $49.99\n2026-06-14  Brake pads front  $189.00\n"
+    fo.ingest_file(conn, cfg, log.encode(), "maintenance-log.txt", description="Service history", folder_id=car["id"])
+    receipts = fo.create_folder(conn, {"name": "Fuel receipts", "icon": "⛽", "parent_id": car["id"], "color": "#ca8a04"})
+    gas = conn.execute("SELECT id FROM expenses WHERE merchant IN ('Shell', 'Chevron') ORDER BY spent_on DESC LIMIT 4").fetchall()
+    fo.add_items(conn, receipts["id"], [{"item_type": "expense", "item_id": r[0]} for r in gas])
+    fo.add_items(conn, car["id"], [{"item_type": "contact", "item_id": cids[7]}])  # Marcus Hale, mechanic
+
+    home = fo.create_folder(conn, {"name": "Home", "icon": "🏠", "color": "#16a34a",
+                                   "description": "House, appliances, warranties and the people who fix things"})
+    fo.add_items(conn, home["id"], [{"item_type": "contact", "item_id": cids[1]}] +
+                 [{"item_type": "record", "item_id": r[0]} for r in
+                  conn.execute("SELECT id FROM section_records WHERE section_id = ?", (inv["id"],))])
+    fo.create_note(conn, {"title": "Wi-Fi & router", "folder_id": home["id"],
+                          "properties": [{"name": "Network", "type": "text", "value": "GuestNetwork"},
+                                         {"name": "Router admin", "type": "url", "value": "http://192.168.1.1"},
+                                         {"name": "ISP support", "type": "phone", "value": "(800) 555-0199"}]})
+    wifi = conn.execute("SELECT id FROM codes WHERE payload LIKE 'WIFI:%'").fetchone()
+    if wifi:
+        fo.add_items(conn, home["id"], [{"item_type": "code", "item_id": wifi[0]}])
+
+    recipes = fo.create_folder(conn, {"name": "Recipes", "icon": "🍳", "color": "#ea580c",
+                                      "template": [{"name": "Servings", "type": "number"},
+                                                   {"name": "Prep time (min)", "type": "number"},
+                                                   {"name": "Rating", "type": "number"},
+                                                   {"name": "Source", "type": "url"}]})
+    fo.create_note(conn, {"title": "Weeknight chili", "folder_id": recipes["id"],
+                          "body": "Brown beef, add onions + peppers, 2 cans beans, 1 can tomatoes, chili powder. Simmer 30 min.",
+                          "properties": [{"name": "Servings", "type": "number", "value": 6},
+                                         {"name": "Prep time (min)", "type": "number", "value": 15},
+                                         {"name": "Rating", "type": "number", "value": 5},
+                                         {"name": "Spicy", "type": "boolean", "value": True}]})
 
 
 def build_parser() -> argparse.ArgumentParser:

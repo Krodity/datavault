@@ -439,9 +439,10 @@ def backup(conn, cfg: Config, include_media: bool = True, label: str = "") -> Pa
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(snap, "datavault.db")
             if include_media:
-                for p in cfg.media_dir.rglob("*"):
-                    if p.is_file():
-                        z.write(p, f"media/{p.relative_to(cfg.media_dir)}", compress_type=zipfile.ZIP_STORED)
+                for folder, prefix in ((cfg.media_dir, "media"), (cfg.files_dir, "files")):
+                    for p in folder.rglob("*"):
+                        if p.is_file() and not p.name.endswith(".part"):
+                            z.write(p, f"{prefix}/{p.relative_to(folder)}", compress_type=zipfile.ZIP_STORED)
             z.writestr("manifest.json", json.dumps({
                 "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "schema_version": conn.execute("PRAGMA user_version").fetchone()[0],
@@ -519,7 +520,8 @@ def restore(cfg: Config, archive: Path) -> None:
             Path(str(cfg.db_path) + ext).unlink(missing_ok=True)
         tmp.replace(cfg.db_path)
         for n in names:
-            if n.startswith("media/") and not n.endswith("/"):
-                target = cfg.media_dir / n[len("media/"):]
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(z.read(n))
+            for prefix, folder in (("media/", cfg.media_dir), ("files/", cfg.files_dir)):
+                if n.startswith(prefix) and not n.endswith("/"):
+                    target = folder / n[len(prefix):]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(z.read(n))

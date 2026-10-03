@@ -898,7 +898,9 @@ def stats(conn) -> dict:
         SELECT (SELECT COUNT(*) FROM contacts) AS contacts, (SELECT COUNT(*) FROM pictures) AS pictures,
                (SELECT COUNT(*) FROM expenses) AS expenses, (SELECT COUNT(*) FROM codes) AS codes,
                (SELECT COUNT(*) FROM sections) AS sections, (SELECT COUNT(*) FROM section_records) AS records,
-               (SELECT COUNT(*) FROM tags) AS tags, (SELECT COALESCE(SUM(size_bytes), 0) FROM pictures) AS media_bytes""")
+               (SELECT COUNT(*) FROM tags) AS tags, (SELECT COALESCE(SUM(size_bytes), 0) FROM pictures) AS media_bytes,
+               (SELECT COUNT(*) FROM folders) AS folders, (SELECT COUNT(*) FROM notes) AS notes,
+               (SELECT COUNT(*) FROM files) AS files, (SELECT COALESCE(SUM(size_bytes), 0) FROM files) AS file_bytes""")
     page = conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute("PRAGMA page_size").fetchone()[0]
     activity = rows(conn.execute("""
         SELECT a.*, CASE a.table_name
@@ -908,9 +910,13 @@ def stats(conn) -> dict:
             WHEN 'codes' THEN (SELECT COALESCE(NULLIF(label, ''), payload) FROM codes WHERE id = a.row_id)
             WHEN 'sections' THEN (SELECT name FROM sections WHERE id = a.row_id)
             WHEN 'section_records' THEN (SELECT s.name FROM section_records r JOIN sections s ON s.id = r.section_id WHERE r.id = a.row_id)
+            WHEN 'notes' THEN (SELECT title FROM notes WHERE id = a.row_id)
+            WHEN 'files' THEN (SELECT original_name FROM files WHERE id = a.row_id)
+            WHEN 'folders' THEN (SELECT name FROM folders WHERE id = a.row_id)
           END AS label
           FROM audit_log a
-         WHERE a.table_name IN ('contacts', 'expenses', 'pictures', 'codes', 'sections', 'section_records')
+         WHERE a.table_name IN ('contacts', 'expenses', 'pictures', 'codes', 'sections', 'section_records',
+                                'notes', 'files', 'folders')
          ORDER BY a.id DESC LIMIT 15"""))
     # Birthdays are built as "Jan 1 of <year> + (month-1) months + (day-1) days"
     # so Feb 29 lands on Mar 1 in non-leap years instead of becoming NULL.
